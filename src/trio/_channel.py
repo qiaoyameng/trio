@@ -174,6 +174,27 @@ class MemoryChannelState(Generic[T]):
             peak_buffer_used=self.peak_buffer_used,
         )
 
+    def set_max_buffer_size(self, new_max_buffer_size: int | float) -> None:
+        if new_max_buffer_size != inf and not isinstance(new_max_buffer_size, int):
+            raise TypeError("max_buffer_size must be an integer or math.inf")
+        if new_max_buffer_size < 0:
+            raise ValueError("max_buffer_size must be >= 0")
+        self.max_buffer_size = new_max_buffer_size
+        # Growing the buffer (or receiving, when it shrank) may give waiting
+        # senders room. Shrinking never removes already-accepted values, and a
+        # send can only complete via the code below (or a direct handoff in
+        # receive_nowait), so blocked senders keep their FIFO positions until
+        # enough room is available. Moving them here also ensures that
+        # send_nowait cannot jump ahead of a waiter that the new capacity
+        # freed a slot for: reschedule() does not yield, so the waiters are
+        # woken before this method returns.
+        while self.send_tasks and len(self.data) < self.max_buffer_size:
+            task, value = self.send_tasks.popitem(last=False)
+            task.custom_sleep_data._tasks.remove(task)
+            self.data.append(value)
+            self.peak_buffer_used = max(self.peak_buffer_used, len(self.data))
+            trio.lowlevel.reschedule(task)
+
 
 @final
 @attrs.define(eq=False, repr=False, slots=False)
@@ -202,6 +223,40 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
         associated with."""
         # XX should we also report statistics specific to this object?
         return self._state.statistics()
+
+    @enable_ki_protection
+    def set_max_buffer_size(self, new_max_buffer_size: int | float) -> None:
+        """Change the capacity of this channel's buffer while it is running.
+
+        All clones of this channel (and of the matching receive channel)
+        immediately see the new capacity, since they share a single underlying
+        buffer and queue of waiting tasks; there is no need to rebuild the
+        channel.
+
+        Shrinking the capacity never discards values that have already been
+        accepted: if more items are buffered than the new capacity allows,
+        they remain in the buffer, and blocked senders (including ones that
+        were already waiting) only complete once receivers have made enough
+        room. Growing the capacity immediately wakes blocked senders in
+        first-in-first-out order, moving as many of their values into the
+        buffer as the new capacity permits; a later `send_nowait` cannot jump
+        ahead of these waiters.
+
+        A capacity of ``0`` keeps the rendezvous semantics of a channel opened
+        with ``max_buffer_size=0``: a send only completes when a receiver is
+        simultaneously ready.
+
+        Raises:
+          trio.ClosedResourceError: if this channel object has been closed.
+          TypeError: if *new_max_buffer_size* is not an integer or
+              ``math.inf``.
+          ValueError: if *new_max_buffer_size* is negative. In this case the
+              channel is left completely unchanged.
+
+        """
+        if self._closed:
+            raise trio.ClosedResourceError
+        self._state.set_max_buffer_size(new_max_buffer_size)
 
     @enable_ki_protection
     def send_nowait(self, value: SendType) -> None:
@@ -353,6 +408,27 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
         """Returns a `MemoryChannelStatistics` for the memory channel this is
         associated with."""
         return self._state.statistics()
+
+    @enable_ki_protection
+    def set_max_buffer_size(self, new_max_buffer_size: int | float) -> None:
+        """Change the capacity of this channel's buffer while it is running.
+
+        This is identical to
+        `MemorySendChannel.set_max_buffer_size`; all clones of either
+        endpoint share the same underlying channel, so the new capacity is
+        visible to all of them. See that method for the detailed semantics.
+
+        Raises:
+          trio.ClosedResourceError: if this channel object has been closed.
+          TypeError: if *new_max_buffer_size* is not an integer or
+              ``math.inf``.
+          ValueError: if *new_max_buffer_size* is negative. In this case the
+              channel is left completely unchanged.
+
+        """
+        if self._closed:
+            raise trio.ClosedResourceError
+        self._state.set_max_buffer_size(new_max_buffer_size)
 
     def __repr__(self) -> str:
         return (

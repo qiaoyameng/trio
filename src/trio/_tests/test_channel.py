@@ -755,3 +755,274 @@ async def test_as_safe_channel_close_during_iteration() -> None:
         # to. Otherwise, this test sometimes passes on a broken
         # version of trio.
         await trio.testing.wait_all_tasks_blocked()
+
+
+async def test_set_max_buffer_size_invalid_leaves_state_unchanged() -> None:
+    send, receive = open_memory_channel[int](2)
+    send.send_nowait(1)
+    send.send_nowait(2)
+
+    with pytest.raises(TypeError):
+        send.set_max_buffer_size(1.5)
+    with pytest.raises(TypeError):
+        receive.set_max_buffer_size("1")
+    with pytest.raises(ValueError, match=r"^max_buffer_size must be >= 0$"):
+        send.set_max_buffer_size(-1)
+
+    stats = send.statistics()
+    assert stats.max_buffer_size == 2
+    assert stats.current_buffer_used == 2
+    assert stats.tasks_waiting_send == 0
+    assert receive.receive_nowait() == 1
+    assert receive.receive_nowait() == 2
+
+
+async def test_set_max_buffer_size_closed_endpoint() -> None:
+    send, receive = open_memory_channel[int](2)
+    send.send_nowait(1)
+    await send.aclose()
+    await receive.aclose()
+    with pytest.raises(trio.ClosedResourceError):
+        send.set_max_buffer_size(5)
+    with pytest.raises(trio.ClosedResourceError):
+        receive.set_max_buffer_size(5)
+
+
+async def test_set_max_buffer_size_seen_by_all_clones() -> None:
+    send, receive = open_memory_channel[int](2)
+    send_clone = send.clone()
+    receive_clone = receive.clone()
+
+    send.set_max_buffer_size(4)
+    assert send_clone.statistics().max_buffer_size == 4
+    assert receive.statistics().max_buffer_size == 4
+
+    receive_clone.set_max_buffer_size(float("inf"))
+    assert send.statistics().max_buffer_size == float("inf")
+    assert send_clone.statistics().max_buffer_size == float("inf")
+
+    await send_clone.aclose()
+    await receive_clone.aclose()
+
+
+async def test_set_max_buffer_size_shrink_then_grow_ordering() -> None:
+    # Three buffered items: shrink below current length keeps every accepted
+    # value; blocked senders stay blocked; growing wakes them in the FIFO
+    # order in which they reached the channel.
+    send, receive = open_memory_channel[int](3)
+    send.send_nowait(0)
+    send.send_nowait(1)
+    send.send_nowait(2)
+    assert send.statistics().current_buffer_used == 3
+
+    completed: list[int] = []
+
+    async def blocked_send(value: int, started: trio.Event) -> None:
+        started.set()
+        await send.send(value)
+        completed.append(value)
+
+    async with trio.open_nursery() as nursery:
+        for value in (3, 4, 5):
+            started = trio.Event()
+            nursery.start_soon(blocked_send, value, started)
+            await started.wait()
+        await wait_all_tasks_blocked()
+        assert send.statistics().tasks_waiting_send == 3
+        assert completed == []
+
+        # Shrink to one: accepted values are preserved, nobody is woken.
+        send.set_max_buffer_size(1)
+        assert receive.statistics().max_buffer_size == 1
+        await wait_all_tasks_blocked()
+        assert send.statistics().current_buffer_used == 3
+        assert send.statistics().tasks_waiting_send == 3
+        assert completed == []
+
+        # Receiving hands the freed slot straight to the oldest waiting
+        # sender (3), even while the buffer still exceeds the shrunken
+        # capacity; accepted values are never lost.
+        assert await receive.receive() == 0
+        await wait_all_tasks_blocked()
+        assert list(send._state.data) == [1, 2, 3]
+        assert list(send._state.send_tasks.values()) == [4, 5]
+        assert completed == [3]
+        assert send.statistics().current_buffer_used == 3
+        assert send.statistics().tasks_waiting_send == 2
+
+        # The next receive wakes the next oldest waiter (4).
+        assert await receive.receive() == 1
+        await wait_all_tasks_blocked()
+        assert list(send._state.send_tasks.values()) == [5]
+        assert list(send._state.data) == [2, 3, 4]
+        assert completed == [3, 4]
+        assert send.statistics().current_buffer_used == 3
+        assert send.statistics().tasks_waiting_send == 1
+
+        # Growing to four immediately wakes the next two waiters in FIFO
+        # order, with no later send_nowait able to cut in.
+        receive.set_max_buffer_size(4)
+        await wait_all_tasks_blocked()
+        assert list(send._state.data) == [2, 3, 4, 5]
+        assert list(send._state.send_tasks.values()) == []
+        assert send.statistics().tasks_waiting_send == 0
+        with pytest.raises(trio.WouldBlock):
+            send.send_nowait(99)
+
+        # All values come out in the original send order.
+        assert await receive.receive() == 2
+        assert await receive.receive() == 3
+        assert await receive.receive() == 4
+        assert await receive.receive() == 5
+        assert set(completed) == {3, 4, 5}
+
+
+async def test_set_max_buffer_size_grow_wakes_waiters_fifo() -> None:
+    send, receive = open_memory_channel[int](0)
+    completed: list[int] = []
+
+    async def blocked_send(value: int) -> None:
+        await send.send(value)
+        completed.append(value)
+
+    async with trio.open_nursery() as nursery:
+        for value in range(4):
+            started = trio.Event()
+
+            async def sender(value: int = value) -> None:
+                started.set()
+                await blocked_send(value)
+
+            nursery.start_soon(sender)
+            await started.wait()
+        await wait_all_tasks_blocked()
+        assert send.statistics().tasks_waiting_send == 4
+
+        # Growing by two slots moves the first two waiters into the buffer.
+        send.set_max_buffer_size(2)
+        await wait_all_tasks_blocked()
+        assert list(send._state.data) == [0, 1]
+        assert send.statistics().tasks_waiting_send == 2
+        assert send.statistics().current_buffer_used == 2
+
+        # The buffer is full of the waiters' values; nowait cannot jump ahead.
+        with pytest.raises(trio.WouldBlock):
+            send.send_nowait(99)
+        assert send.statistics().tasks_waiting_send == 2
+
+        send.set_max_buffer_size(float("inf"))
+        await wait_all_tasks_blocked()
+        assert send.statistics().tasks_waiting_send == 0
+
+        received = [receive.receive_nowait() for _ in range(4)]
+        assert received == [0, 1, 2, 3]
+        assert set(completed) == {0, 1, 2, 3}
+
+
+async def test_set_max_buffer_size_to_zero_keeps_rendezvous() -> None:
+    send, receive = open_memory_channel[int](2)
+    send.send_nowait(10)
+    send.set_max_buffer_size(0)
+    assert receive.statistics().max_buffer_size == 0
+    # Already-accepted value is retained even though capacity is now zero.
+    with pytest.raises(trio.WouldBlock):
+        send.send_nowait(11)
+    assert receive.receive_nowait() == 10
+
+    completed: list[int] = []
+
+    async def blocked_send(value: int) -> None:
+        await send.send(value)
+        completed.append(value)
+
+    async def rendezvous_receiver() -> None:
+        assert await receive.receive() == 11
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(blocked_send, 11)
+        await wait_all_tasks_blocked()
+        assert send.statistics().tasks_waiting_send == 1
+        # Growing to zero-ish state: still blocked without a receiver.
+        send.set_max_buffer_size(0)
+        assert completed == []
+        nursery.start_soon(rendezvous_receiver)
+        await wait_all_tasks_blocked()
+        assert completed == [11]
+        assert send.statistics().tasks_waiting_send == 0
+
+
+async def test_set_max_buffer_size_cancel_during_grow() -> None:
+    send, receive = open_memory_channel[int](0)
+    completed: list[int] = []
+
+    async def blocked_send(value: int) -> None:
+        await send.send(value)
+        completed.append(value)
+
+    async with trio.open_nursery() as nursery:
+        for value in range(3):
+            started = trio.Event()
+
+            async def sender(value: int = value) -> None:
+                started.set()
+                await blocked_send(value)
+
+            nursery.start_soon(sender)
+            await started.wait()
+        await wait_all_tasks_blocked()
+        assert send.statistics().tasks_waiting_send == 3
+
+        # Only one slot: the oldest waiter is moved into the buffer.
+        send.set_max_buffer_size(1)
+        await wait_all_tasks_blocked()
+        assert completed == [0]
+        assert send.statistics().tasks_waiting_send == 2
+
+        # Cancelling the remaining waiters must remove them exactly once.
+        nursery.cancel_scope.cancel()
+
+    assert completed == [0]
+    stats = send.statistics()
+    assert stats.tasks_waiting_send == 0
+    assert stats.current_buffer_used == 1
+    assert receive.receive_nowait() == 0
+
+
+async def test_set_max_buffer_size_close_during_grow() -> None:
+    send, receive = open_memory_channel[int](0)
+    send_clone = send.clone()
+
+    results: list[object] = []
+
+    async def blocked_send(value: int) -> None:
+        try:
+            await send_clone.send(value)
+        except BaseException as exc:  # noqa: BLE001
+            results.append(exc)
+        else:
+            results.append(value)
+
+    async with trio.open_nursery() as nursery:
+        for value in range(2):
+            started = trio.Event()
+
+            async def sender(value: int = value) -> None:
+                started.set()
+                await blocked_send(value)
+
+            nursery.start_soon(sender)
+            await started.wait()
+        await wait_all_tasks_blocked()
+        assert send_clone.statistics().tasks_waiting_send == 2
+
+        # Close the receive side, then grow: close already failed the
+        # waiters, so growing must not reschedule them a second time.
+        await receive.aclose()
+        assert send_clone.statistics().tasks_waiting_send == 0
+        send_clone.set_max_buffer_size(5)
+        await wait_all_tasks_blocked()
+        assert all(isinstance(item, trio.BrokenResourceError) for item in results)
+        assert len(results) == 2
+
+    await send_clone.aclose()
+    await send.aclose()
