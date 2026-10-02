@@ -1569,6 +1569,9 @@ don't have any special access to Trio's internals.)
 .. autoclass:: Condition
    :members:
 
+.. autoclass:: Barrier
+   :members:
+
 These primitives return statistics objects that can be inspected.
 
 .. autoclass:: CapacityLimiterStatistics
@@ -1578,6 +1581,15 @@ These primitives return statistics objects that can be inspected.
    :members:
 
 .. autoclass:: ConditionStatistics
+   :members:
+
+.. autoclass:: BarrierStatistics
+   :members:
+
+.. autoclass:: BarrierWaitResult
+   :members:
+
+.. autoclass:: BrokenBarrierError
    :members:
 
 .. _async-generators:

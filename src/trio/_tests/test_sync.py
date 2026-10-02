@@ -730,3 +730,485 @@ async def test_lock_handover() -> None:
 
     assert lock._lot.broken_by == [child_task]
     assert not GLOBAL_PARKING_LOT_BREAKER
+
+
+
+
+async def test_Barrier_invalid_parties() -> None:
+    with pytest.raises(TypeError):
+        Barrier(3.0)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        # bool is a subtype of int but is not a valid participant count
+        Barrier(True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=r"^parties must be >= 1$"):
+        Barrier(0)
+    with pytest.raises(ValueError, match=r"^parties must be >= 1$"):
+        Barrier(-2)
+
+
+async def test_Barrier_single_party_is_coordinator_and_checkpoint() -> None:
+    b = Barrier(1)
+    assert b.statistics() == BarrierStatistics(
+        parties=1,
+        tasks_waiting=0,
+        generation=0,
+        broken=False,
+    )
+    with assert_checkpoints():
+        result = await b.wait()
+    assert result.coordinator
+    assert result.party == 0
+    assert result.generation == 0
+    result2 = await b.wait()
+    assert result2.coordinator
+    assert result2.generation == 1
+    assert b.generation == 2
+    assert b.n_waiting == 0
+
+
+async def test_Barrier_wait_cancelled_before_entering_does_not_break() -> None:
+    b = Barrier(2)
+    with trio.move_on_at(float("-inf")):
+        await b.wait()
+    assert not b.broken
+    assert b.n_waiting == 0
+    assert b.generation == 0
+    # The barrier still completes a normal generation afterwards.
+    box: list[BarrierWaitResult] = []
+
+    async def one() -> None:
+        box.append(await b.wait())
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(one)
+        nursery.start_soon(one)
+    assert sum(r.coordinator for r in box) == 1
+
+
+class _CancelLastArriverInstrument:
+    """Cancel ``scope`` at the exact step where the last participant has
+    registered but has not yet crossed the barrier's release checkpoint.
+
+    The last task is in the generation's waiting set but is not parked in
+    the generation's parking lot, while the other ``parties - 1`` tasks are.
+    That unique state makes the injection point deterministic.
+    """
+
+    def __init__(self, barrier: Barrier, scope: trio.CancelScope) -> None:
+        self._barrier = barrier
+        self._scope = scope
+        self.armed = False
+        self.fired = False
+
+    def _scope_is_active_for(self, task: _core.Task) -> bool:
+        status = task._cancel_status
+        while status is not None:
+            if status._scope is self._scope:
+                return True
+            status = getattr(status, "_parent", None)
+        return False
+
+    def before_task_step(self, task: _core.Task) -> None:
+        if not self.armed or self.fired:
+            return
+        gen = self._barrier._gen  # type: ignore[attr-defined]
+        # The last arriver is the task whose step makes the waiting set
+        # full while the other ``parties - 1`` tasks are still parked. We
+        # additionally confirm the targeted cancel scope is active for the
+        # stepping task, which rules out the controlling task.
+        if (
+            gen is self._barrier._gen
+            and len(gen.waiting) == self._barrier.parties
+            and len(gen.lot._parked) == self._barrier.parties - 1  # type: ignore[attr-defined]
+            and task in gen.waiting
+            and task not in gen.lot._parked  # type: ignore[attr-defined]
+            and self._scope_is_active_for(task)
+        ):
+            self.fired = True
+            self.armed = False
+            self._scope.cancel()
+
+
+async def test_Barrier_controlled_four_rounds_with_cancel_and_reset() -> None:
+    parties = 3
+    b = Barrier(parties)
+
+    # admit[round][index] gates admission of one participant into one round,
+    # so the controller can admit the first parties-1 tasks, let them park,
+    # and only then admit the final participant.
+    admit: list[list[trio.Event]] = [
+        [trio.Event() for _ in range(parties)] for _ in range(4)
+    ]
+    # The cancel scope for round 3 is created before the participant waits
+    # on its admission gate, so it exists for the instrument to target while
+    # the final participant is still outside the barrier.
+    round3_scopes = {i: trio.CancelScope() for i in range(parties)}
+    outcomes: dict[int, list[str]] = {i: [] for i in range(parties)}
+
+    async def participant(index: int) -> None:
+        for round_index in range(4):
+            await admit[round_index][index].wait()
+            if round_index == 2:
+                scope = round3_scopes[index]
+            else:
+                scope = trio.CancelScope()
+            result: BarrierWaitResult | None = None
+            broken = False
+            with scope:
+                try:
+                    result = await b.wait()
+                except BrokenBarrierError:
+                    broken = True
+            # A CancelScope swallows its own Cancelled, so that case is read
+            # from the scope instead of caught (this also avoids reusing a
+            # previous round's ``result`` across loop iterations).
+            if scope.cancel_called:
+                outcomes[index].append(f"cancelled-r{round_index}")
+            elif broken:
+                outcomes[index].append(f"broken-r{round_index}")
+            else:
+                assert result is not None
+                outcomes[index].append(
+                    f"{'coord' if result.coordinator else 'waiter'}-g{result.generation}",
+                )
+
+    async with _core.open_nursery() as nursery:
+        for i in range(parties):
+            nursery.start_soon(participant, i)
+
+        # ---- Rounds 1 and 2: two clean, fully controlled generations. ----
+        for round_index in range(2):
+            for i in range(parties):
+                admit[round_index][i].set()
+            await wait_all_tasks_blocked()
+            assert b.n_waiting == 0
+            assert not b.broken
+            assert b.generation == round_index + 1
+
+        # ---- Round 3 --------------------------------------------------
+        gen_before = b.generation
+
+        # Admit the first parties-1 participants and wait until they are
+        # parked: waiting set non-full, nobody released yet.
+        for i in range(parties - 1):
+            admit[2][i].set()
+        while b.n_waiting < parties - 1:
+            await _core.checkpoint()
+        await wait_all_tasks_blocked()
+        assert b.n_waiting == parties - 1
+        assert not b.broken
+        assert b.generation == gen_before
+
+        # Arm before admitting the last participant. The instrument fires at
+        # the last arriver's release checkpoint and cancels that generation.
+        instrument = _CancelLastArriverInstrument(b, round3_scopes[parties - 1])
+        instrument.armed = True
+        trio.lowlevel.add_instrument(instrument)
+        try:
+            admit[2][parties - 1].set()
+            await wait_all_tasks_blocked()
+        finally:
+            trio.lowlevel.remove_instrument(instrument)
+        assert instrument.fired
+
+        assert b.broken
+        assert b.generation == gen_before
+        await wait_all_tasks_blocked()
+
+        # ---- Reset clears the broken generation and starts a new one. ----
+        b.reset()
+        assert not b.broken
+        assert b.n_waiting == 0
+        assert b.generation == gen_before + 1
+
+        # ---- Round 4: clean release on the fresh generation. ----
+        for i in range(parties):
+            admit[3][i].set()
+        await wait_all_tasks_blocked()
+        assert b.n_waiting == 0
+        assert not b.broken
+        assert b.generation == gen_before + 2
+
+    # Each participant recorded exactly one outcome per round.
+    for i in range(parties):
+        assert len(outcomes[i]) == 4, (i, outcomes[i])
+
+    # Successful rounds 1, 2 and 4 produced generations 0, 1 and 3 with one
+    # coordinator each.
+    coord_generations = sorted(
+        int(tag.split("g")[1])
+        for i in range(parties)
+        for tag in outcomes[i]
+        if tag.startswith("coord")
+    )
+    assert coord_generations == [0, 1, 3]
+
+    # Round 3: exactly one cancellation (the last arriver) and parties-1
+    # BrokenBarrierError wakeups -- no success leaked into that round.
+    cancelled = [i for i in range(parties) if "cancelled-r2" in outcomes[i]]
+    broken = [i for i in range(parties) if "broken-r2" in outcomes[i]]
+    assert cancelled == [parties - 1]
+    assert sorted(broken) == list(range(parties - 1))
+
+    # Round 4: everyone released in generation 3, exactly one coordinator.
+    round4 = [outcomes[i][3] for i in range(parties)]
+    assert round4.count("coord-g3") == 1
+    assert round4.count("waiter-g3") == parties - 1
+
+
+async def test_Barrier_abort_wakes_current_generation() -> None:
+    parties = 3
+    b = Barrier(parties)
+    woken: list[int] = []
+
+    async def participant(i: int) -> None:
+        with pytest.raises(BrokenBarrierError):
+            await b.wait()
+        woken.append(i)
+
+    async with _core.open_nursery() as nursery:
+        for i in range(parties - 1):
+            nursery.start_soon(participant, i)
+        await wait_all_tasks_blocked()
+        assert b.n_waiting == parties - 1
+        assert not b.broken
+        b.abort()
+        await wait_all_tasks_blocked()
+        assert sorted(woken) == [0, 1]
+
+    assert b.broken
+    # Waiting on a broken generation raises but wait() stays a checkpoint.
+    with assert_checkpoints():
+        with pytest.raises(BrokenBarrierError):
+            await b.wait()
+    assert b.n_waiting == 0
+
+
+async def test_Barrier_abort_is_idempotent_and_reset_recovers() -> None:
+    b = Barrier(2)
+    b.abort()
+    assert b.broken
+    assert b.generation == 0
+    b.abort()  # safe to call again with nobody waiting
+    assert b.broken
+    b.reset()
+    assert not b.broken
+    assert b.n_waiting == 0
+    assert b.generation == 1
+
+    box: list[BarrierWaitResult] = []
+
+    async def one() -> None:
+        box.append(await b.wait())
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(one)
+        nursery.start_soon(one)
+    assert b.generation == 2
+    assert sum(r.coordinator for r in box) == 1
+    assert {r.generation for r in box} == {1}
+
+
+async def test_Barrier_reset_wakes_waiters_then_new_generation_succeeds() -> None:
+    parties = 2
+    b = Barrier(parties)
+    woken = []
+
+    async def participant() -> None:
+        with pytest.raises(BrokenBarrierError):
+            await b.wait()
+        woken.append(True)
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(participant)
+        await wait_all_tasks_blocked()
+        assert b.n_waiting == 1
+        gen_before = b.generation
+        b.reset()
+        await wait_all_tasks_blocked()
+        assert woken == [True]
+
+    assert not b.broken
+    assert b.n_waiting == 0
+    assert b.generation == gen_before + 1
+
+    # A fresh generation completes normally, proving the abandoned
+    # generation's late cleanup cannot corrupt the new one.
+    box: list[BarrierWaitResult] = []
+
+    async def pair() -> None:
+        box.append(await b.wait())
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(pair)
+        nursery.start_soon(pair)
+    assert b.n_waiting == 0
+    assert b.generation == gen_before + 2
+    assert sum(r.coordinator for r in box) == 1
+    assert {r.generation for r in box} == {gen_before + 1}
+
+
+async def test_Barrier_cancelled_waiter_breaks_and_wakes_peers() -> None:
+    parties = 3
+    b = Barrier(parties)
+    peer_outcomes: list[str] = []
+    admit = [trio.Event() for _ in range(parties)]
+    # The cancel scope exists before the final participant enters, so the
+    # controller can cancel exactly that participant in the release window.
+    last_scope = trio.CancelScope()
+    instrument = _CancelLastArriverInstrument(b, last_scope)
+
+    async def peer(index: int) -> None:
+        await admit[index].wait()
+        try:
+            await b.wait()
+        except BrokenBarrierError:
+            peer_outcomes.append(f"broken-{index}")
+
+    async def last_participant() -> None:
+        await admit[parties - 1].wait()
+        with last_scope:
+            await b.wait()
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(peer, 0)
+        nursery.start_soon(peer, 1)
+        nursery.start_soon(last_participant)
+
+        # First parties-1 participants park; the barrier must not trip yet.
+        admit[0].set()
+        admit[1].set()
+        while b.n_waiting < parties - 1:
+            await _core.checkpoint()
+        await wait_all_tasks_blocked()
+        assert b.n_waiting == parties - 1
+        assert not b.broken
+
+        # Admit the final participant and cancel it in its release window.
+        instrument.armed = True
+        trio.lowlevel.add_instrument(instrument)
+        try:
+            admit[parties - 1].set()
+            await wait_all_tasks_blocked()
+        finally:
+            trio.lowlevel.remove_instrument(instrument)
+        assert instrument.fired
+
+        while len(peer_outcomes) < parties - 1:
+            await _core.checkpoint()
+
+    assert sorted(peer_outcomes) == ["broken-0", "broken-1"]
+    assert b.broken
+
+
+async def test_Barrier_statistics_distinguish_waiting_and_generation() -> None:
+    b = Barrier(3)
+    assert b.parties == 3
+    assert b.n_waiting == 0
+    assert b.generation == 0
+    assert not b.broken
+
+    async def hold() -> None:
+        try:
+            await b.wait()
+        except BrokenBarrierError:
+            pass
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(hold)
+        nursery.start_soon(hold)
+        await wait_all_tasks_blocked()
+        stats = b.statistics()
+        assert stats.tasks_waiting == 2
+        assert stats.generation == 0
+        assert stats.parties == 3
+        assert stats.broken is False
+        b.abort()
+        await wait_all_tasks_blocked()
+        stats = b.statistics()
+        assert stats.broken is True
+        assert stats.tasks_waiting == 0
+        assert stats.generation == 0  # abort leaves the generation number alone
+
+    b.reset()
+    stats = b.statistics()
+    assert stats.broken is False
+    assert stats.tasks_waiting == 0
+    assert stats.generation == 1
+
+
+async def test_Barrier_wait_again_during_release_joins_next_generation() -> None:
+    # A non-coordinator task calls wait() again as soon as it wakes, while
+    # the generation is being rolled over. It must join the *new* generation
+    # rather than be mistaken for a duplicate of the old one, and the two
+    # generations must each release exactly once with one coordinator.
+    parties = 2
+    b = Barrier(parties)
+    fast_generations: list[int] = []
+    rounds = 3
+
+    async def fast_task() -> None:
+        for _ in range(rounds):
+            result = await b.wait()
+            fast_generations.append(result.generation)
+
+    async def slow_task() -> None:
+        for round_index in range(rounds):
+            result = await b.wait()
+            assert result.generation == round_index
+            # Yield a little before re-entering so the fast task can rush
+            # ahead into the next generation mid-release.
+            await _core.checkpoint()
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(fast_task)
+        nursery.start_soon(slow_task)
+
+    assert sorted(fast_generations) == [0, 1, 2]
+    assert b.generation == rounds
+    assert not b.broken
+    assert b.n_waiting == 0
+
+
+async def test_Barrier_abort_before_release_checkpoint_then_reset_then_ok() -> None:
+    # abort() while participants are parked breaks the generation; an
+    # immediate reset starts a clean generation even though the aborted
+    # waiters have not yet processed their wakeups.
+    parties = 2
+    b = Barrier(parties)
+    outcomes: list[str] = []
+
+    async def participant() -> None:
+        try:
+            await b.wait()
+        except BrokenBarrierError:
+            outcomes.append("broken")
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(participant)
+        await wait_all_tasks_blocked()
+        assert b.n_waiting == 1
+        b.abort()
+        # Reset before the parked participant has run; this must start a new
+        # generation that the late cleanup of the old one cannot break.
+        b.reset()
+        await wait_all_tasks_blocked()
+        assert outcomes == ["broken"]
+        assert not b.broken
+        assert b.generation == 1
+        assert b.n_waiting == 0
+
+
+async def test_Barrier_no_reentry_same_task() -> None:
+    b = Barrier(2)
+    task = _core.current_task()
+    # A single coroutine cannot genuinely call wait() twice concurrently,
+    # so the guard is exercised directly: pretend this task is already in
+    # the generation and confirm wait() refuses it.
+    b._gen.waiting.add(task)  # type: ignore[attr-defined]
+    try:
+        with pytest.raises(RuntimeError, match="can't wait on a Barrier twice"):
+            await b.wait()
+    finally:
+        b._gen.waiting.discard(task)  # type: ignore[attr-defined]
+    assert b.n_waiting == 0

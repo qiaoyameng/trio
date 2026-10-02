@@ -83,6 +83,10 @@ from ._ssl import (
 )
 from ._subprocess import Process as Process, run_process as run_process
 from ._sync import (
+    Barrier as Barrier,
+    BarrierStatistics as BarrierStatistics,
+    BarrierWaitResult as BarrierWaitResult,
+    BrokenBarrierError as BrokenBarrierError,
     CapacityLimiter as CapacityLimiter,
     CapacityLimiterStatistics as CapacityLimiterStatistics,
     Condition as Condition,

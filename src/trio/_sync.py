@@ -880,3 +880,273 @@ class Condition(AsyncContextManagerMixin):
             tasks_waiting=len(self._lot),
             lock_statistics=self._lock.statistics(),
         )
+
+
+@final
+@attrs.frozen
+class BarrierWaitResult:
+    """The result of :meth:`Barrier.wait`.
+
+    Attributes:
+      party (int): The zero-based position at which the calling task
+          arrived in this generation of the barrier (``0`` for the first
+          task, ``parties - 1`` for the last).
+      coordinator (bool): :data:`True` for exactly one task per generation
+          -- the last task to arrive, which triggers the release.
+      generation (int): The generation in which the calling task waited,
+          starting at ``0`` and incremented once per completed generation
+          and every :meth:`Barrier.reset`.
+
+    """
+
+    party: int
+    coordinator: bool
+    generation: int
+
+
+@attrs.frozen
+class BarrierStatistics:
+    """An object containing debugging information.
+
+    Currently the following fields are defined:
+
+    * ``parties`` (int): The fixed number of tasks that must arrive before
+      each generation of the barrier releases.
+    * ``tasks_waiting`` (int): The number of tasks currently in the barrier
+      -- i.e. that have called :meth:`Barrier.wait` in the current
+      generation but have not yet returned.
+    * ``generation`` (int): The current generation of the barrier. This
+      starts at ``0`` and increments by one every time a generation
+      completes (all ``parties`` tasks arrive) or
+      :meth:`Barrier.reset` is called.
+    * ``broken`` (bool): Whether the current generation is broken. It stays
+      broken until :meth:`Barrier.reset` is called.
+
+    """
+
+    parties: int
+    tasks_waiting: int
+    generation: int
+    broken: bool
+
+
+@attrs.define(eq=False, slots=False)
+class _BarrierGeneration:
+    lot: ParkingLot = attrs.field(factory=ParkingLot)
+    waiting: set[Task] = attrs.field(factory=set)
+    broken: bool = attrs.field(default=False)
+
+
+class BrokenBarrierError(RuntimeError):
+    """Raised when a :class:`Barrier` is in a broken generation.
+
+    A generation becomes broken when a task that has entered the barrier
+    is cancelled or calls :meth:`Barrier.abort`. All other tasks in that
+    generation are woken and raise this exception, and any further
+    :meth:`Barrier.wait` calls raise it until :meth:`Barrier.reset` starts
+    a fresh generation.
+    """
+
+
+@final
+class Barrier:
+    """A reusable barrier for a fixed number of tasks.
+
+    A barrier lets a group of ``parties`` tasks synchronize with each
+    other in *generations* (also called *rounds*). Each task calls
+    :meth:`wait`; the call blocks until all ``parties`` tasks have called
+    :meth:`wait`, at which point they are all released simultaneously and
+    the barrier is automatically reset for the next generation. This is
+    similar to :class:`asyncio.Barrier` and
+    :class:`threading.Barrier`.
+
+    :meth:`wait` returns a :class:`BarrierWaitResult`. Exactly one task in
+    each generation -- the last one to arrive -- gets ``coordinator=True``.
+    This lets the group deterministically pick a single coordinator for
+    the round without an extra election step.
+
+    A generation becomes *broken* when one of the tasks waiting in it is
+    cancelled or calls :meth:`abort`. When that happens, every other task
+    in the same generation is woken and raises :class:`BrokenBarrierError`,
+    and all later :meth:`wait` calls keep raising it. Call :meth:`reset`
+    to clear the broken state and begin a fresh generation.
+
+    Args:
+      parties (int): The fixed number of tasks required to trip the
+          barrier. Must be an integer ``>= 1``.
+
+    Raises:
+      ValueError: if ``parties`` is less than ``1``.
+      TypeError: if ``parties`` is not an integer.
+
+    """
+
+    def __init__(self, parties: int) -> None:
+        if isinstance(parties, bool) or not isinstance(parties, int):
+            raise TypeError("parties must be an int")
+        if parties < 1:
+            raise ValueError("parties must be >= 1")
+        self._parties = parties
+        self._gen = _BarrierGeneration()
+        self._generation = 0
+        self._n_arrived = 0
+
+    def __repr__(self) -> str:
+        return (
+            f"<trio.Barrier parties={self._parties} "
+            f"generation={self._generation} "
+            f"waiting={len(self._gen.waiting)} "
+            f"{'broken' if self._gen.broken else 'ready'}>"
+        )
+
+    @property
+    def parties(self) -> int:
+        """The fixed number of participants required to release each generation."""
+        return self._parties
+
+    @property
+    def n_waiting(self) -> int:
+        """The number of tasks currently in the barrier for this generation."""
+        return len(self._gen.waiting)
+
+    @property
+    def generation(self) -> int:
+        """The current generation number; starts at ``0``."""
+        return self._generation
+
+    @property
+    def broken(self) -> bool:
+        """Whether the current generation is broken."""
+        return self._gen.broken
+
+    def statistics(self) -> BarrierStatistics:
+        """Return an object containing debugging information.
+
+        See :class:`BarrierStatistics` for the fields that are currently
+        defined.
+        """
+        return BarrierStatistics(
+            parties=self._parties,
+            tasks_waiting=len(self._gen.waiting),
+            generation=self._generation,
+            broken=self._gen.broken,
+        )
+
+    def _open_next_generation(self, *, mark_old_broken: bool = False) -> None:
+        # Swap in a fresh generation before waking anyone, so that tasks
+        # released here (or any late cleanup from the old generation) can
+        # never touch the new generation's state.
+        old_gen = self._gen
+        self._gen = _BarrierGeneration()
+        self._generation += 1
+        self._n_arrived = 0
+        # A normal trip releases the old generation successfully, but a
+        # reset abandons it: its waiters must wake up seeing it as broken.
+        if mark_old_broken:
+            old_gen.broken = True
+        old_gen.lot.unpark_all()
+
+    def _break_generation(self, gen: _BarrierGeneration) -> None:
+        # Only the current generation can be broken; late cleanup from an
+        # already-released generation must be a no-op.
+        if gen is not self._gen or gen.broken:
+            return
+        gen.broken = True
+        gen.lot.unpark_all()
+
+    @enable_ki_protection
+    def abort(self) -> None:
+        """Put the current generation into the broken state.
+
+        All tasks currently waiting in the barrier are woken and raise
+        :class:`BrokenBarrierError`. The barrier stays broken until
+        :meth:`reset` is called. Safe to call when no one is waiting; it
+        still marks the generation broken.
+        """
+        self._break_generation(self._gen)
+
+    @enable_ki_protection
+    def reset(self) -> None:
+        """Start a new generation.
+
+        Any tasks currently waiting in the barrier are woken and raise
+        :class:`BrokenBarrierError`. The broken state (if any) is cleared,
+        the waiting count is reset to zero, and the generation number is
+        incremented. Cleanup belonging to the old generation that happens
+        after this call does not affect the new generation.
+        """
+        self._open_next_generation(mark_old_broken=True)
+
+    @enable_ki_protection
+    async def wait(self) -> BarrierWaitResult:
+        """Wait until all ``parties`` tasks have arrived in this generation.
+
+        When the last task arrives, all tasks are released together and the
+        barrier moves on to the next generation. Returns a
+        :class:`BarrierWaitResult`; exactly one returned object per
+        generation has ``coordinator=True`` (the last task to arrive).
+
+        Raises:
+          BrokenBarrierError: if the generation is broken by a cancelled
+              participant or an :meth:`abort` call, or if the barrier is
+              already broken when this is called.
+          RuntimeError: if the calling task has already entered this
+              generation of the barrier (no re-entrant waiting).
+        """
+        task = _core.current_task()
+
+        # This checkpoint means wait() is always a schedule point and any
+        # cancellation that was already requested is delivered before we
+        # mutate barrier state.
+        await trio.lowlevel.checkpoint_if_cancelled()
+
+        gen = self._gen
+        gen_id = self._generation
+        if gen.broken:
+            await trio.lowlevel.checkpoint()
+            raise BrokenBarrierError(
+                "this Barrier generation is broken; call reset() to continue",
+            )
+        if task in gen.waiting:
+            raise RuntimeError("can't wait on a Barrier twice from the same task")
+
+        party = self._n_arrived
+        self._n_arrived += 1
+        gen.waiting.add(task)
+
+        if len(gen.waiting) == self._parties:
+            # We are the last arrival and thus this generation's
+            # coordinator. All other participants are parked; this full
+            # checkpoint is the last cancellation point before release.
+            # If cancellation becomes effective here, the generation is
+            # broken instead of released and the parked participants are
+            # woken to receive BrokenBarrierError.
+            try:
+                await trio.lowlevel.checkpoint()
+            except trio.Cancelled:
+                self._break_generation(gen)
+                raise
+            finally:
+                gen.waiting.discard(task)
+            self._open_next_generation()
+            return BarrierWaitResult(
+                party=party,
+                coordinator=True,
+                generation=gen_id,
+            )
+
+        try:
+            await gen.lot.park()
+        except trio.Cancelled:
+            self._break_generation(gen)
+            raise
+        finally:
+            gen.waiting.discard(task)
+
+        # We were unparked either because the generation was released or
+        # because it was broken.
+        if gen.broken:
+            raise BrokenBarrierError(
+                "this Barrier generation was broken while waiting",
+            )
+        return BarrierWaitResult(party=party, coordinator=False, generation=gen_id)
