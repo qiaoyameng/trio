@@ -137,6 +137,14 @@ Trio also provides some specialized functions for testing completely
 exhibit an extreme kind of behavior that's good at catching out edge
 cases in protocol implementations.
 
+For protocol tests that need a low-bandwidth, fixed-latency connection,
+:func:`memory_network_stream_pair` creates bounded in-memory streams driven
+only by Trio's clock. Pair it with :class:`MockClock` to advance propagation
+delay and byte-rate timing deterministically. In each direction,
+:meth:`~trio.abc.SendStream.send_all` completes once the requested bytes have
+been accepted by that simulated link; pausing the receiver applies
+backpressure, and graceful EOF remains ordered behind accepted bytes.
+
 
 API details
 ~~~~~~~~~~~
@@ -152,6 +160,10 @@ API details
 .. autofunction:: memory_stream_one_way_pair
 
 .. autofunction:: memory_stream_pair
+
+.. autofunction:: memory_network_stream_one_way_pair
+
+.. autofunction:: memory_network_stream_pair
 
 .. autofunction:: lockstep_stream_one_way_pair
 

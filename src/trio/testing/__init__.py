@@ -24,6 +24,8 @@ from ._memory_streams import (
     MemorySendStream as MemorySendStream,
     lockstep_stream_one_way_pair as lockstep_stream_one_way_pair,
     lockstep_stream_pair as lockstep_stream_pair,
+    memory_network_stream_one_way_pair as memory_network_stream_one_way_pair,
+    memory_network_stream_pair as memory_network_stream_pair,
     memory_stream_one_way_pair as memory_stream_one_way_pair,
     memory_stream_pair as memory_stream_pair,
     memory_stream_pump as memory_stream_pump,

@@ -626,6 +626,221 @@ async def test_lockstep_streams_with_generic_tests() -> None:
     await check_two_way_stream(two_way_stream_maker, two_way_stream_maker)
 
 
+async def test_memory_network_stream_timing_and_backpressure(
+    mock_clock: MockClock,
+) -> None:
+    sender, receiver = memory_network_stream_one_way_pair(
+        latency=1,
+        bytes_per_second=2,
+        buffer_size=3,
+    )
+
+    send_result = "pending"
+    chunks: list[bytes] = []
+
+    async def receive() -> None:
+        for _ in range(6):
+            chunks.append(await receiver.receive_some(1))
+
+    async def send() -> None:
+        nonlocal send_result
+        await sender.send_all(b"abcdef")
+        send_result = "done"
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(receive)
+        nursery.start_soon(send)
+        await wait_all_tasks_blocked()
+        assert chunks == []
+        assert send_result == "pending"
+
+        mock_clock.jump(1)
+        await wait_all_tasks_blocked()
+        assert chunks == [b"a"]
+        assert send_result == "pending"
+
+        mock_clock.jump(0.5)
+        await wait_all_tasks_blocked()
+        assert chunks == [b"a", b"b"]
+        assert send_result == "pending"
+
+        mock_clock.jump(0.5)
+        await wait_all_tasks_blocked()
+        assert chunks == [b"a", b"b", b"c", b"d"]
+        assert send_result == "done"
+
+        mock_clock.jump(0.5)
+        await wait_all_tasks_blocked()
+        assert chunks == [b"a", b"b", b"c", b"d", b"e"]
+
+        mock_clock.jump(0.5)
+        await wait_all_tasks_blocked()
+        assert chunks == [b"a", b"b", b"c", b"d", b"e", b"f"]
+
+    await sender.aclose()
+    mock_clock.jump(1)
+    assert await receiver.receive_some(10) == b""
+    await sender.aclose()
+    await receiver.aclose()
+
+
+async def test_memory_network_stream_cancelled_send_is_not_duplicated(
+    mock_clock: MockClock,
+) -> None:
+    sender, receiver = memory_network_stream_one_way_pair(buffer_size=2)
+    send_result = "pending"
+
+    async def send() -> None:
+        nonlocal send_result
+        try:
+            await sender.send_all(b"abcdef")
+        except _core.Cancelled:
+            send_result = "cancelled"
+            raise
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(send)
+        await wait_all_tasks_blocked()
+        assert send_result == "pending"
+        nursery.cancel_scope.cancel()
+
+    assert send_result == "cancelled"
+    assert await receiver.receive_some(10) == b"ab"
+    await sender.aclose()
+    assert await receiver.receive_some(10) == b""
+
+
+async def test_memory_network_stream_bidirectional(mock_clock: MockClock) -> None:
+    left, right = memory_network_stream_pair(
+        latency=1,
+        bytes_per_second=1,
+        buffer_size=3,
+    )
+    left_received: list[bytes] = []
+    right_received: list[bytes] = []
+
+    async def receive_left() -> None:
+        for _ in range(2):
+            left_received.append(await left.receive_some(1))
+
+    async def receive_right() -> None:
+        for _ in range(2):
+            right_received.append(await right.receive_some(1))
+
+    async def send_left() -> None:
+        await left.send_all(b"xy")
+
+    async def send_right() -> None:
+        await right.send_all(b"zw")
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(receive_left)
+        nursery.start_soon(receive_right)
+        nursery.start_soon(send_left)
+        nursery.start_soon(send_right)
+        await wait_all_tasks_blocked()
+
+        mock_clock.jump(1)
+        await wait_all_tasks_blocked()
+        assert left_received == [b"z"]
+        assert right_received == [b"x"]
+
+        mock_clock.jump(1)
+        await wait_all_tasks_blocked()
+        assert left_received == [b"z", b"w"]
+        assert right_received == [b"x", b"y"]
+
+        await left.send_eof()
+        await right.send_eof()
+        mock_clock.jump(1)
+        assert await right.receive_some(10) == b""
+        assert await left.receive_some(10) == b""
+
+
+async def test_memory_network_stream_wait_send_all_might_not_block(
+    mock_clock: MockClock,
+) -> None:
+    sender, receiver = memory_network_stream_one_way_pair(buffer_size=1)
+    await sender.send_all(b"a")
+    send_unblocked = False
+
+    async def wait_send() -> None:
+        nonlocal send_unblocked
+        await sender.wait_send_all_might_not_block()
+        send_unblocked = True
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(wait_send)
+        await wait_all_tasks_blocked()
+        assert not send_unblocked
+
+        assert await receiver.receive_some(1) == b"a"
+        await wait_all_tasks_blocked()
+        assert send_unblocked
+
+
+async def test_memory_network_streams_with_generic_tests() -> None:
+    async def one_way_stream_maker() -> tuple[SendStream, ReceiveStream]:
+        return memory_network_stream_one_way_pair()
+
+    async def clogged_one_way_stream_maker() -> tuple[SendStream, ReceiveStream]:
+        return memory_network_stream_one_way_pair(buffer_size=0)
+
+    await check_one_way_stream(one_way_stream_maker, clogged_one_way_stream_maker)
+
+    async def half_closeable_stream_maker() -> tuple[
+        StapledStream[SendStream, ReceiveStream],
+        StapledStream[SendStream, ReceiveStream],
+    ]:
+        return memory_network_stream_pair()
+
+    async def clogged_half_closeable_stream_maker() -> tuple[
+        StapledStream[SendStream, ReceiveStream],
+        StapledStream[SendStream, ReceiveStream],
+    ]:
+        return memory_network_stream_pair(buffer_size=0)
+
+    await check_half_closeable_stream(
+        half_closeable_stream_maker,
+        clogged_half_closeable_stream_maker,
+    )
+
+
+async def test_memory_network_stream_settings() -> None:
+    for kwargs in (
+        {"latency": -1},
+        {"bytes_per_second": 0},
+        {"bytes_per_second": -1},
+        {"buffer_size": -1},
+    ):
+        with pytest.raises(ValueError):
+            memory_network_stream_one_way_pair(**kwargs)
+
+    sender, receiver = memory_network_stream_one_way_pair(
+        latency=0,
+        bytes_per_second=float("inf"),
+        buffer_size=0,
+    )
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(sender.send_all, b"x")
+        await wait_all_tasks_blocked()
+        assert await receiver.receive_some(1) == b"x"
+
+    await sender.aclose()
+    assert await receiver.receive_some(1) == b""
+
+
+async def test_memory_network_stream_peer_close() -> None:
+    sender, receiver = memory_network_stream_one_way_pair()
+    await receiver.aclose()
+
+    with pytest.raises(_core.BrokenResourceError):
+        await sender.send_all(b"x")
+    with pytest.raises(_core.ClosedResourceError):
+        await receiver.receive_some(1)
+
+
 async def test_open_stream_to_socket_listener() -> None:
     async def check(listener: SocketListener) -> None:
         async with listener:

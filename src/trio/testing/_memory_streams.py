@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import operator
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import TypeAlias, TypeVar
 
@@ -13,6 +15,24 @@ AsyncHook: TypeAlias = Callable[[], Awaitable[object]]
 SyncHook: TypeAlias = Callable[[], object]
 SendStreamT = TypeVar("SendStreamT", bound=SendStream)
 ReceiveStreamT = TypeVar("ReceiveStreamT", bound=ReceiveStream)
+
+
+def _validate_network_settings(
+    latency: float,
+    bytes_per_second: float,
+    buffer_size: int | float,
+) -> tuple[float, float, int | float]:
+    latency = float(latency)
+    bytes_per_second = float(bytes_per_second)
+    if not math.isfinite(latency) or latency < 0:
+        raise ValueError("latency must be a finite, non-negative number")
+    if bytes_per_second <= 0 or math.isnan(bytes_per_second):
+        raise ValueError("bytes_per_second must be > 0")
+    if buffer_size != math.inf:
+        buffer_size = operator.index(buffer_size)
+        if buffer_size < 0:
+            raise ValueError("buffer_size must be >= 0")
+    return latency, bytes_per_second, buffer_size
 
 
 ################################################################
@@ -453,6 +473,348 @@ def memory_stream_pair() -> tuple[
 
     """
     return _make_stapled_pair(memory_stream_one_way_pair)
+
+
+################################################################
+# In-memory streams - Timed network version
+################################################################
+
+
+class _TimedByteQueue:
+    def __init__(
+        self,
+        latency: float,
+        bytes_per_second: float,
+        buffer_size: int | float,
+    ) -> None:
+        self._latency = latency
+        self._bytes_per_second = bytes_per_second
+        self._buffer_size = buffer_size
+        self._data: deque[tuple[bytearray | None, float, float]] = deque()
+        self._outstanding_bytes = 0
+        self._next_send_free: float | None = None
+        self._eof_scheduled = False
+        self._eof_delivered = False
+        self._sender_closed = False
+        self._receiver_closed = False
+        self._receiver_allowance = 0
+        self._send_waiters = _core.ParkingLot()
+        self._receive_waiters = _core.ParkingLot()
+
+    def _wake_senders(self) -> None:
+        self._send_waiters.unpark_all()
+
+    def _wake_receivers(self) -> None:
+        self._receive_waiters.unpark_all()
+
+    def _available_space(self) -> int | float:
+        if self._receiver_closed:
+            return 0
+        if self._buffer_size == 0:
+            return self._receiver_allowance
+        return self._buffer_size - self._outstanding_bytes
+
+    def _admit(self, data: bytes | bytearray | memoryview) -> int:
+        data = bytearray(data)
+        if not data or self._receiver_closed or self._sender_closed:
+            return 0
+
+        available = self._available_space()
+        if available <= 0:
+            return 0
+
+        now = _core.current_time()
+        transmission_start = now if self._next_send_free is None else max(
+            now,
+            self._next_send_free,
+        )
+        if available != math.inf:
+            count = min(len(data), available)
+        else:
+            count = len(data)
+        chunk = data[:count]
+        first_ready_at = transmission_start + self._latency
+        if self._bytes_per_second == math.inf:
+            last_ready_at = first_ready_at
+        else:
+            last_ready_at = first_ready_at + (count - 1) / self._bytes_per_second
+        self._data.append((chunk, first_ready_at, last_ready_at))
+        self._outstanding_bytes += count
+        if self._buffer_size == 0 and self._receiver_allowance != math.inf:
+            self._receiver_allowance -= count
+        if self._bytes_per_second == math.inf:
+            self._next_send_free = transmission_start
+        else:
+            self._next_send_free = (
+                transmission_start + (count - 1) / self._bytes_per_second
+            )
+        self._wake_receivers()
+        return count
+
+    def _schedule_eof(self) -> None:
+        if self._eof_scheduled or self._receiver_closed:
+            return
+        now = _core.current_time()
+        if self._next_send_free is None:
+            ready_at = now + self._latency
+        else:
+            ready_at = max(now, self._next_send_free) + self._latency
+        self._data.append((None, ready_at, ready_at))
+        self._eof_scheduled = True
+        self._wake_receivers()
+
+    def close_sender(self) -> None:
+        if not self._sender_closed:
+            self._sender_closed = True
+            self._schedule_eof()
+            self._wake_senders()
+            self._wake_receivers()
+
+    def close_receiver(self) -> None:
+        self._receiver_closed = True
+        self._receiver_allowance = 0
+        self._data.clear()
+        self._outstanding_bytes = 0
+        self._next_send_free = None
+        self._wake_senders()
+        self._wake_receivers()
+
+    async def send_all(self, data: bytes | bytearray | memoryview) -> None:
+        await _core.checkpoint()
+        await _core.checkpoint()
+        if self._sender_closed:
+            raise _core.ClosedResourceError
+        if self._receiver_closed:
+            raise _core.BrokenResourceError
+
+        view = memoryview(data)
+        while view:
+            if self._sender_closed:
+                raise _core.ClosedResourceError
+            if self._receiver_closed:
+                raise _core.BrokenResourceError
+            admitted = self._admit(view)
+            if admitted:
+                view = view[admitted:]
+                continue
+            await self._send_waiters.park()
+
+    async def wait_send_all_might_not_block(self) -> None:
+        await _core.checkpoint()
+        await _core.checkpoint()
+        while True:
+            if self._sender_closed:
+                raise _core.ClosedResourceError
+            if self._receiver_closed:
+                raise _core.BrokenResourceError
+            if self._available_space() > 0:
+                return
+            await self._send_waiters.park()
+
+    def _mature_count(
+        self,
+        chunk: bytearray,
+        first_ready_at: float,
+        last_ready_at: float,
+    ) -> int:
+        now = _core.current_time()
+        if now < first_ready_at:
+            return 0
+        if self._bytes_per_second == math.inf:
+            return len(chunk)
+        if now >= last_ready_at:
+            return len(chunk)
+        elapsed = now - first_ready_at
+        return int(elapsed * self._bytes_per_second) + 1
+
+    def _get_nowait(
+        self,
+        max_bytes: int | None,
+    ) -> tuple[bytearray | None, bool, float | None]:
+        if self._eof_delivered:
+            return bytearray(), True, None
+
+        result = bytearray()
+        limit = max_bytes
+        while self._data:
+            chunk, first_ready_at, last_ready_at = self._data[0]
+            if chunk is None:
+                if first_ready_at <= _core.current_time():
+                    self._data.popleft()
+                    self._eof_delivered = True
+                    return result, True, None
+                if result:
+                    return result, False, None
+                return result, False, first_ready_at
+
+            count = self._mature_count(chunk, first_ready_at, last_ready_at)
+            if count == 0:
+                return result, False, first_ready_at
+            if limit is not None:
+                count = min(count, limit - len(result))
+                if count == 0:
+                    break
+            result += chunk[:count]
+            del chunk[:count]
+            if chunk:
+                self._data[0] = (
+                    chunk,
+                    first_ready_at + count / self._bytes_per_second,
+                    last_ready_at,
+                )
+            else:
+                self._data.popleft()
+            if max_bytes is not None and len(result) >= max_bytes:
+                break
+
+        if result:
+            return result, False, None
+        if self._sender_closed:
+            self._eof_delivered = True
+            return bytearray(), True, None
+        return result, False, None
+
+    async def receive_some(self, max_bytes: int | None = None) -> bytearray:
+        while True:
+            if self._receiver_closed:
+                raise _core.ClosedResourceError
+            data, eof, next_ready_at = self._get_nowait(max_bytes)
+            if data or eof:
+                if self._outstanding_bytes:
+                    received = len(data)
+                    self._outstanding_bytes -= received
+                    self._wake_senders()
+                return data
+
+            self._receiver_allowance = math.inf if max_bytes is None else max_bytes
+            self._wake_senders()
+            try:
+                if next_ready_at is not None:
+                    scope = _core.CancelScope(deadline=next_ready_at)
+                    with scope:
+                        await self._receive_waiters.park()
+                else:
+                    await self._receive_waiters.park()
+            finally:
+                self._receiver_allowance = 0
+
+
+class _MemoryNetworkSendStream(SendStream):
+    def __init__(self, queue: _TimedByteQueue) -> None:
+        self._queue = queue
+        self._conflict_detector = _util.ConflictDetector(
+            "another task is using this stream",
+        )
+
+    async def send_all(self, data: bytes | bytearray | memoryview) -> None:
+        with self._conflict_detector:
+            await self._queue.send_all(data)
+
+    async def wait_send_all_might_not_block(self) -> None:
+        with self._conflict_detector:
+            await self._queue.wait_send_all_might_not_block()
+
+    def close(self) -> None:
+        self._queue.close_sender()
+
+    async def aclose(self) -> None:
+        self.close()
+        await _core.checkpoint()
+
+
+class _MemoryNetworkReceiveStream(ReceiveStream):
+    def __init__(self, queue: _TimedByteQueue) -> None:
+        self._queue = queue
+        self._closed = False
+        self._conflict_detector = _util.ConflictDetector(
+            "another task is using this stream",
+        )
+
+    async def receive_some(self, max_bytes: int | None = None) -> bytearray:
+        if max_bytes is not None:
+            max_bytes = operator.index(max_bytes)
+            if max_bytes < 1:
+                raise ValueError("max_bytes must be >= 1")
+        with self._conflict_detector:
+            await _core.checkpoint()
+            await _core.checkpoint()
+            if self._closed:
+                raise _core.ClosedResourceError
+            data = await self._queue.receive_some(max_bytes)
+            if self._closed:
+                raise _core.ClosedResourceError
+            return data
+
+    def close(self) -> None:
+        self._closed = True
+        self._queue.close_receiver()
+
+    async def aclose(self) -> None:
+        self.close()
+        await _core.checkpoint()
+
+
+def memory_network_stream_one_way_pair(
+    *,
+    latency: float = 0.0,
+    bytes_per_second: float = math.inf,
+    buffer_size: int | float = math.inf,
+) -> tuple[SendStream, ReceiveStream]:
+    """Create a timed, bounded, pure-Python unidirectional stream.
+
+    Args:
+      latency: One-way propagation time in seconds.
+      bytes_per_second: Link byte rate, or :data:`math.inf` for no rate
+          limit.
+      buffer_size: Maximum number of bytes that the simulated link will
+          accept before applying backpressure.
+
+    A successful :meth:`~trio.abc.SendStream.send_all` means that all of its
+    bytes were accepted by the simulated link. Accepted bytes are delivered in
+    order, and a graceful end-of-file is delivered after all of them.
+
+    """
+    latency, bytes_per_second, buffer_size = _validate_network_settings(
+        latency,
+        bytes_per_second,
+        buffer_size,
+    )
+    queue = _TimedByteQueue(latency, bytes_per_second, buffer_size)
+    return _MemoryNetworkSendStream(queue), _MemoryNetworkReceiveStream(queue)
+
+
+def memory_network_stream_pair(
+    *,
+    latency: float = 0.0,
+    bytes_per_second: float = math.inf,
+    buffer_size: int | float = math.inf,
+) -> tuple[
+    StapledStream[SendStream, ReceiveStream],
+    StapledStream[SendStream, ReceiveStream],
+]:
+    """Create a timed, bounded, pure-Python bidirectional stream.
+
+    The supplied settings are applied independently to each direction. Use
+    this with :class:`MockClock` to test low-bandwidth, fixed-latency
+    connections without waiting for real time.
+
+    """
+    settings = _validate_network_settings(
+        latency,
+        bytes_per_second,
+        buffer_size,
+    )
+    queue1 = _TimedByteQueue(*settings)
+    queue2 = _TimedByteQueue(*settings)
+    stream1 = StapledStream(
+        _MemoryNetworkSendStream(queue1),
+        _MemoryNetworkReceiveStream(queue2),
+    )
+    stream2 = StapledStream(
+        _MemoryNetworkSendStream(queue2),
+        _MemoryNetworkReceiveStream(queue1),
+    )
+    return stream1, stream2
 
 
 ################################################################
