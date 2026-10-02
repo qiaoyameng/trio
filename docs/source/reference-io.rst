@@ -193,6 +193,8 @@ streams interface, you should also check out :ref:`testing-streams` in
 
 .. autofunction:: serve_listeners
 
+.. autofunction:: forward_streams
+
 .. autoclass:: StapledStream
    :members:
    :show-inheritance:

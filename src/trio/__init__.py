@@ -54,6 +54,7 @@ from ._dtls import (
     DTLSEndpoint as DTLSEndpoint,
 )
 from ._file_io import open_file as open_file, wrap_file as wrap_file
+from ._highlevel_forward import forward_streams as forward_streams
 from ._highlevel_generic import (
     StapledStream as StapledStream,
     aclose_forcefully as aclose_forcefully,

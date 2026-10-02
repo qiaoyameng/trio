@@ -1,0 +1,6 @@
+Added `trio.forward_streams`, a helper that forwards data between two
+streams in both directions at once -- the building block you want when
+writing things like TCP proxies. It propagates EOF as a half-close
+(using `trio.abc.HalfCloseableStream.send_eof` when available), applies
+backpressure with bounded per-direction buffering, and reliably closes
+both streams on errors, cancellation, or completion.
