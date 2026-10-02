@@ -57,6 +57,8 @@ from ._file_io import open_file as open_file, wrap_file as wrap_file
 from ._highlevel_generic import (
     StapledStream as StapledStream,
     aclose_forcefully as aclose_forcefully,
+    forward_stream as forward_stream,
+    forward_streams as forward_streams,
 )
 from ._highlevel_open_tcp_listeners import (
     open_tcp_listeners as open_tcp_listeners,

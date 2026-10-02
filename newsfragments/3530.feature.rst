@@ -1,0 +1,1 @@
+Added `trio.forward_stream` for bounded, half-close-aware forwarding between two bidirectional streams.
