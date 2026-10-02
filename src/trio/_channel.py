@@ -17,7 +17,14 @@ from outcome import Error, Value
 import trio
 
 from ._abc import ReceiveChannel, ReceiveType, SendChannel, SendType, T
-from ._core import Abort, BrokenResourceError, RaiseCancelT, Task, enable_ki_protection
+from ._core import (
+    Abort,
+    BrokenResourceError,
+    ChannelFailed,
+    RaiseCancelT,
+    Task,
+    enable_ki_protection,
+)
 from ._util import (
     MultipleExceptionError,
     NoPublicConstructor,
@@ -162,6 +169,10 @@ class MemoryChannelState(Generic[T]):
     receive_tasks: OrderedDict[Task, None] = attrs.Factory(OrderedDict)
     # The largest len(self.data) has ever been
     peak_buffer_used: int = 0
+    # Set by MemorySendChannel.fail(); the first failure wins and later
+    # failures are ignored.
+    failed: bool = False
+    failure_reason: BaseException | None = None
 
     def statistics(self) -> MemoryChannelStatistics:
         return MemoryChannelStatistics(
@@ -213,6 +224,9 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
             raise trio.ClosedResourceError
         if self._state.open_receive_channels == 0:
             raise trio.BrokenResourceError
+        if self._state.failed:
+            assert self._state.failure_reason is not None
+            raise ChannelFailed(self._state.failure_reason)
         if self._state.receive_tasks:
             assert not self._state.data
             task, _ = self._state.receive_tasks.popitem(last=False)
@@ -332,6 +346,68 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
         self.close()
         await trio.lowlevel.checkpoint()
 
+    @enable_ki_protection
+    def fail(self, reason: BaseException) -> None:
+        """Terminate the entire channel with a failure, synchronously.
+
+        Unlike `close`, which only closes this one endpoint and uses
+        reference counting, `fail` immediately terminates the underlying
+        channel for *all* endpoints: any send clone can fail the whole
+        channel. This endpoint is also closed, as if by `close`.
+
+        Data that was successfully sent before the failure is still
+        delivered: receivers first drain the remaining buffer, and only
+        then get `trio.ChannelFailed` (with :attr:`reason
+        <trio.ChannelFailed.reason>` set to the exception passed here)
+        instead of `trio.EndOfChannel`. This lets receivers distinguish a
+        producer failure from a normal end-of-stream.
+
+        Tasks currently blocked in `send` (on any clone) are woken
+        immediately with `trio.ChannelFailed`, and later `send` calls on
+        the remaining open clones fail the same way.
+
+        If multiple send clones call `fail`, the first call wins: later
+        calls close their own endpoint but do not change the recorded
+        reason. Plain `close` is unaffected and keeps its usual reference
+        counting semantics.
+
+        If all receive endpoints have already been closed, the failure is
+        recorded but senders keep seeing `trio.BrokenResourceError` from
+        the receiver-initiated close; the failure reason does not override
+        it.
+
+        Args:
+          reason: The exception describing why the producer failed. It is
+            delivered to receivers as ``trio.ChannelFailed.reason``.
+
+        Raises:
+          TypeError: if ``reason`` is not an exception instance.
+          trio.ClosedResourceError: if you already closed this
+              `MemorySendChannel` object.
+
+        """
+        if not isinstance(reason, BaseException):
+            raise TypeError("reason must be an exception instance")
+        if self._closed:
+            raise trio.ClosedResourceError
+        if not self._state.failed:
+            self._state.failed = True
+            self._state.failure_reason = reason
+            # Wake all tasks blocked in send(), on this object and all
+            # clones: their values were never accepted by the channel.
+            for task in self._state.send_tasks:
+                task.custom_sleep_data._tasks.remove(task)
+                trio.lowlevel.reschedule(task, Error(ChannelFailed(reason)))
+            self._state.send_tasks.clear()
+            # Tasks blocked in receive() only exist when the buffer is
+            # empty, so there is no buffered data for them to drain and we
+            # can fail them immediately.
+            for task in self._state.receive_tasks:
+                task.custom_sleep_data._tasks.remove(task)
+                trio.lowlevel.reschedule(task, Error(ChannelFailed(reason)))
+            self._state.receive_tasks.clear()
+        self.close()
+
 
 @final
 @attrs.define(eq=False, repr=False, slots=False)
@@ -375,6 +451,9 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
             # Fall through
         if self._state.data:
             return self._state.data.popleft()
+        if self._state.failed:
+            assert self._state.failure_reason is not None
+            raise ChannelFailed(self._state.failure_reason)
         if not self._state.open_send_channels:
             raise trio.EndOfChannel
         raise trio.WouldBlock

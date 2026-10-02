@@ -1,0 +1,5 @@
+Add `trio.MemorySendChannel.fail`, which terminates a memory channel with a
+reason: receivers first drain any buffered data and then get
+`trio.ChannelFailed` (carrying the original reason as ``.reason`` and
+``__cause__``) instead of a plain `trio.EndOfChannel`, so consumers can
+distinguish a producer failure from a normal end-of-stream.

@@ -35,6 +35,7 @@ from ._core import (
     BusyResourceError as BusyResourceError,
     Cancelled as Cancelled,
     CancelScope as CancelScope,
+    ChannelFailed as ChannelFailed,
     ClosedResourceError as ClosedResourceError,
     EndOfChannel as EndOfChannel,
     Nursery as Nursery,

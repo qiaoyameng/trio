@@ -12,6 +12,7 @@ from ._exceptions import (
     BrokenResourceError,
     BusyResourceError,
     Cancelled,
+    ChannelFailed,
     ClosedResourceError,
     EndOfChannel,
     RunFinishedError,

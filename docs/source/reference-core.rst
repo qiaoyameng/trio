@@ -2094,6 +2094,8 @@ Exceptions and warnings
 
 .. autoexception:: EndOfChannel
 
+.. autoexception:: ChannelFailed
+
 .. autoexception:: BusyResourceError
 
 .. autoexception:: ClosedResourceError

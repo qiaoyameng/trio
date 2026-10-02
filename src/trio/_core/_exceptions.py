@@ -167,3 +167,24 @@ class EndOfChannel(Exception):
     This is analogous to an "end-of-file" condition, but for channels.
 
     """
+
+
+class ChannelFailed(Exception):
+    """Raised by channel operations after the channel was terminated by
+    :meth:`MemorySendChannel.fail <trio.MemorySendChannel.fail>`.
+
+    This indicates that a producer explicitly marked the channel as failed,
+    as opposed to a normal end-of-stream (which raises
+    :exc:`EndOfChannel`). Receivers drain any data that was successfully
+    sent before the failure, and only then raise this exception.
+
+    The original exception passed to
+    :meth:`MemorySendChannel.fail <trio.MemorySendChannel.fail>` is available
+    as the :attr:`reason` attribute, and also as ``__cause__``.
+
+    """
+
+    def __init__(self, reason: BaseException) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.__cause__ = reason
