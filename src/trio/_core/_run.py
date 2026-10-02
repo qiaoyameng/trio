@@ -64,9 +64,11 @@ if sys.version_info < (3, 11):
 if TYPE_CHECKING:
     import contextvars
     import types
+    from .._task_handle import TaskHandle
     from collections.abc import (
         Awaitable,
         Callable,
+        Coroutine,
         Generator,
         Iterator,
         Sequence,
@@ -87,7 +89,7 @@ else:
     StatusT = TypeVar("StatusT")
     StatusT_contra = TypeVar("StatusT_contra", contravariant=True)
 
-RetT = TypeVar("RetT")
+    RetT = TypeVar("RetT")
 
 
 DEADLINE_HEAP_MIN_PRUNE_THRESHOLD: Final = 1000
@@ -1220,6 +1222,14 @@ class Nursery(metaclass=NoPublicConstructor):
         assert self.cancel_scope._cancel_status is self._cancel_status
         self._children: set[Task] = set()
         self._pending_excs: list[BaseException] = []
+        # Exceptions that already reached this nursery as the outcome of a
+        # start_soon_with_handle() child task, tracked by *identity*. If
+        # the exact same exception object then propagates out of a
+        # TaskHandle.wait() call in the nested child (or another waiter),
+        # it must not be counted a second time. The exceptions are also
+        # held in _pending_excs below, so this adds no lifetime beyond the
+        # nursery's close.
+        self._handle_observed_excs: list[BaseException] = []
         # The "nested child" is how this code refers to the contents of the
         # nursery's 'async with' block, which acts like a child Task in all
         # the ways we can make it.
@@ -1239,7 +1249,23 @@ class Nursery(metaclass=NoPublicConstructor):
         "(`~trio.lowlevel.Task`):  The Task that opened this nursery."
         return self._parent_task
 
-    def _add_exc(self, exc: BaseException, reason: CancelReason | None) -> None:
+    def _add_exc(
+        self,
+        exc: BaseException,
+        reason: CancelReason | None,
+        *,
+        from_nested_child: bool = False,
+    ) -> None:
+        if from_nested_child and any(
+            exc is observed for observed in self._handle_observed_excs
+        ):
+            # The nested child (the 'async with' block) re-raised an
+            # exception it read via TaskHandle.wait(). We already counted
+            # this exact object as the child task's own outcome, so just
+            # make sure the nursery is winding down without recording it
+            # again.
+            self.cancel_scope._cancel(reason)
+            return
         self._pending_excs.append(exc)
         self.cancel_scope._cancel(reason)
 
@@ -1260,6 +1286,8 @@ class Nursery(metaclass=NoPublicConstructor):
             # We're abandoned by misnested nurseries, the result of the task is lost.
             return
         if isinstance(outcome, Error):
+            if task._is_handle_task:
+                self._handle_observed_excs.append(outcome.error)
             self._add_exc(
                 outcome.error,
                 CancelReason(
@@ -1267,6 +1295,7 @@ class Nursery(metaclass=NoPublicConstructor):
                     source_task=repr(task),
                     reason=f"child task raised exception {outcome.error!r}",
                 ),
+                from_nested_child=False,
             )
         self._check_nursery_closed()
 
@@ -1284,6 +1313,7 @@ class Nursery(metaclass=NoPublicConstructor):
                     source_task=repr(self._parent_task),
                     reason=f"Code block inside nursery contextmanager raised exception {nested_child_exc!r}",
                 ),
+                from_nested_child=True,
             )
         self._nested_child_running = False
         self._check_nursery_closed()
@@ -1383,6 +1413,72 @@ class Nursery(metaclass=NoPublicConstructor):
                           exited).
         """
         GLOBAL_RUN_CONTEXT.runner.spawn_impl(async_fn, args, self, name)
+
+    def start_soon_with_handle(
+        self,
+        async_fn: Callable[[Unpack[PosArgT]], Awaitable[RetT]],
+        *args: Unpack[PosArgT],
+        name: object = None,
+    ) -> TaskHandle[RetT]:
+        """Creates a child task, like :meth:`start_soon`, and returns a
+        :class:`~trio.TaskHandle` for observing it.
+
+        This is still ordinary nursery-spawned work: the nursery waits for
+        the task on exit and applies its usual exception rules. The handle
+        only offers three extra capabilities *within* the nursery's
+        lifetime:
+
+        * wait until this one task finishes (``await handle.wait()`` or
+          ``await handle.join()``), with any number of waiters sharing the
+          same result;
+        * read the value it returned or the exception it raised;
+        * cancel just this one task via ``handle.cancel()`` (its own
+          :class:`~trio.CancelScope`).
+
+        Cancelling a task that is waiting on the handle cancels only that
+        wait, never the child task. If the child task fails, then waiting
+        on the handle re-raises its exception, but the exception is *also*
+        still delivered to the nursery, which raises it when the nursery
+        closes as usual. Reading a result never detaches the task.
+
+        Args:
+            async_fn: An async callable.
+            args: Positional arguments for ``async_fn``. If you want
+                  to pass keyword arguments, use
+                  :func:`functools.partial`.
+            name: The name for this task, as for :meth:`start_soon`.
+
+        Raises:
+            RuntimeError: If this nursery is no longer open
+                          (i.e. its ``async with`` block has exited).
+            TypeError: If ``async_fn`` is not an async function.
+        """
+        # Imported lazily to avoid an import cycle (_task_handle imports
+        # from trio._core).
+        from .._task_handle import _create_task_handle, _run_task_with_handle
+
+        handle = _create_task_handle(CancelScope())
+        runner = GLOBAL_RUN_CONTEXT.runner
+        if self._closed:
+            raise RuntimeError("Nursery is closed to new arrivals")
+        # Build both coroutines eagerly, here in the caller's context, so
+        # that "startup failures" (a non-async callable, or async_fn
+        # raising while being invoked) surface at the call site and now --
+        # just like start_soon -- instead of later, from inside the
+        # nursery. The contextvars copy happens in spawn_impl, matching
+        # start_soon; calling the async function itself is context-free.
+        user_coro = coroutine_or_error(async_fn, *args)
+        coro = _run_task_with_handle(user_coro, handle)
+        task = runner.spawn_impl(
+            _run_task_with_handle,
+            (),
+            self,
+            async_fn if name is None else name,
+            coro=coro,
+        )
+        task._is_handle_task = True
+        handle._task = task
+        return handle
 
     # Typing changes blocked by https://github.com/python/mypy/pull/17512
     async def start(  # type: ignore[explicit-any]
@@ -1493,6 +1589,9 @@ class Task(metaclass=NoPublicConstructor):  # type: ignore[explicit-any]
     context: contextvars.Context
     _counter: int = attrs.field(init=False, factory=itertools.count().__next__)
     _ki_protected: bool
+    # True for tasks spawned via Nursery.start_soon_with_handle; used by the
+    # nursery to deduplicate the child's outcome from a wait() re-raise.
+    _is_handle_task: bool = attrs.field(default=False, init=False)
 
     # Invariant:
     # - for unscheduled tasks, _next_send_fn and _next_send are both None
@@ -1939,6 +2038,7 @@ class Runner:  # type: ignore[explicit-any]
         *,
         system_task: bool = False,
         context: contextvars.Context | None = None,
+        coro: Coroutine[object, object, object] | None = None,
     ) -> Task:
         ######
         # Make sure the nursery is in working order
@@ -1962,8 +2062,9 @@ class Runner:  # type: ignore[explicit-any]
         # Call the function and get the coroutine object, while giving helpful
         # errors for common mistakes.
         ######
-        # TypeVarTuple passed into ParamSpec function confuses Mypy.
-        coro = context.run(coroutine_or_error, async_fn, *args)  # type: ignore[arg-type]
+        if coro is None:
+            # TypeVarTuple passed into ParamSpec function confuses Mypy.
+            coro = context.run(coroutine_or_error, async_fn, *args)  # type: ignore[arg-type]
 
         if name is None:
             name = async_fn

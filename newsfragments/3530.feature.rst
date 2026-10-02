@@ -1,0 +1,7 @@
+Nurseries now have `~trio.Nursery.start_soon_with_handle`, which spawns a
+child task like :meth:`~trio.Nursery.start_soon` but returns a
+:class:`~trio.TaskHandle`. The handle lets multiple tasks wait for and
+read that one child's return value or exception, and request cancellation
+of just that child, while the nursery still supervises the task and keeps
+its normal exception and shutdown semantics -- reading a result never
+detaches the task from the nursery.

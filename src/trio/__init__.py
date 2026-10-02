@@ -94,6 +94,7 @@ from ._sync import (
     Semaphore as Semaphore,
     StrictFIFOLock as StrictFIFOLock,
 )
+from ._task_handle import TaskHandle as TaskHandle
 from ._timeouts import (
     TooSlowError as TooSlowError,
     fail_after as fail_after,
