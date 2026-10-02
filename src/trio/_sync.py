@@ -880,3 +880,219 @@ class Condition(AsyncContextManagerMixin):
             tasks_waiting=len(self._lot),
             lock_statistics=self._lock.statistics(),
         )
+
+
+@attrs.frozen
+class BarrierStatistics:
+    """An object containing debugging information for a :class:`Barrier`.
+
+    Currently the following fields are defined:
+
+    * ``tasks_waiting``: The number of tasks currently blocked in
+      :meth:`Barrier.wait`, waiting for the rest of the current
+      generation's participants to arrive.
+    * ``generation``: The current generation of the barrier. This is
+      incremented each time a generation ends, either by being released
+      (all parties arrived) or by a call to :meth:`Barrier.reset`.
+
+    """
+
+    tasks_waiting: int
+    generation: int
+
+
+class _BarrierWaiter:
+    """Bookkeeping record for one task parked in :meth:`Barrier.wait`."""
+
+    __slots__ = ("generation", "index", "outcome")
+
+    def __init__(self, generation: int, index: int) -> None:
+        self.generation = generation
+        self.index = index
+        # None while still parked; set to "released" or "broken" when the
+        # waiter's generation ends. Recording the outcome per-waiter means a
+        # later reset() can't make a stale wakeup look like a new generation.
+        self.outcome: Literal["released", "broken"] | None = None
+
+
+@final
+class Barrier:
+    """A reusable barrier for synchronizing a fixed number of tasks.
+
+    A barrier lets a fixed set of ``parties`` tasks synchronize in
+    generations: each task calls :meth:`wait`, which blocks until every
+    party has arrived, at which point all of them are released and the
+    barrier becomes ready for the next generation.
+
+    Each call to :meth:`wait` returns an integer in
+    ``range(parties)`` that is unique within its generation; the task
+    that receives ``0`` can be used as the generation's designated
+    coordinator (e.g. to perform cleanup or setup for the next round).
+
+    If a task is cancelled while waiting, or :meth:`abort` is called,
+    the current generation is *broken*: all tasks waiting in it are
+    woken with :class:`trio.BrokenResourceError`, and further calls to
+    :meth:`wait` raise :class:`trio.BrokenResourceError` until
+    :meth:`reset` is called. :meth:`reset` ends the current generation
+    (waking any waiters with :class:`trio.BrokenResourceError`) and
+    starts a fresh, unbroken generation.
+
+    Args:
+      parties (int): The number of tasks that must call :meth:`wait`
+        before the barrier releases them. Must be >= 1.
+
+    """
+
+    def __init__(self, parties: int) -> None:
+        if not isinstance(parties, int):
+            raise TypeError("parties must be an int")
+        if parties < 1:
+            raise ValueError("parties must be >= 1")
+        self._parties = parties
+        self._lot = trio.lowlevel.ParkingLot()
+        self._drain_lot = trio.lowlevel.ParkingLot()
+        self._waiters: dict[Task, _BarrierWaiter] = {}
+        self._generation = 0
+        self._broken = False
+        # While a generation is draining (released, but some of its tasks
+        # haven't resumed yet), new calls to wait() block on _drain_lot
+        # instead of joining the next generation prematurely.
+        self._releasing = False
+        self._to_exit = 0
+
+    @property
+    def parties(self) -> int:
+        """The number of tasks required to release the barrier."""
+        return self._parties
+
+    @property
+    def broken(self) -> bool:
+        """Whether the barrier is currently in the broken state."""
+        return self._broken
+
+    def __repr__(self) -> str:
+        state = ", broken" if self._broken else ""
+        return (
+            f"<trio.Barrier({self._parties}) generation {self._generation}"
+            f"{state} at {id(self):#x}>"
+        )
+
+    def statistics(self) -> BarrierStatistics:
+        """Return an object containing debugging information.
+
+        See :class:`BarrierStatistics` for details.
+
+        """
+        return BarrierStatistics(
+            tasks_waiting=len(self._waiters), generation=self._generation
+        )
+
+    def _wake_waiters(self, outcome: Literal["released", "broken"]) -> None:
+        for waiter in self._waiters.values():
+            waiter.outcome = outcome
+        self._waiters.clear()
+        self._lot.unpark_all()
+
+    def _release(self) -> None:
+        self._releasing = True
+        self._to_exit = len(self._waiters)
+        self._wake_waiters("released")
+        self._generation += 1
+
+    def _exit(self) -> None:
+        self._to_exit -= 1
+        if self._to_exit == 0:
+            self._releasing = False
+            self._drain_lot.unpark_all()
+
+    @enable_ki_protection
+    def abort(self) -> None:
+        """Break the current generation of the barrier.
+
+        All tasks currently waiting are woken with
+        :class:`trio.BrokenResourceError`, and further calls to
+        :meth:`wait` raise :class:`trio.BrokenResourceError` until
+        :meth:`reset` is called. Does nothing if the barrier is already
+        broken.
+
+        """
+        if not self._broken:
+            self._broken = True
+            self._wake_waiters("broken")
+
+    @enable_ki_protection
+    def reset(self) -> None:
+        """End the current generation and start a fresh one.
+
+        Any tasks currently waiting are woken with
+        :class:`trio.BrokenResourceError`, the broken state (if any) is
+        cleared, and the barrier becomes usable for a new generation.
+        Cleanup belonging to the old generation cannot affect the new
+        one.
+
+        """
+        self._wake_waiters("broken")
+        self._broken = False
+        self._generation += 1
+
+    @enable_ki_protection
+    async def wait(self) -> int:
+        """Wait for all parties to arrive, then return together.
+
+        Blocks until ``parties`` tasks have called :meth:`wait` in the
+        current generation, then releases all of them. If a previous
+        generation is still in the process of being released, blocks
+        until that finishes and then joins the next generation.
+
+        Returns:
+          An integer in ``range(parties)``, unique within this
+          generation. Exactly one task per generation receives ``0``;
+          that task can act as the generation's coordinator.
+
+        Raises:
+          trio.BrokenResourceError: if the barrier is broken, or was
+              broken (by a cancelled waiter, :meth:`abort`, or
+              :meth:`reset`) while this call was waiting.
+          RuntimeError: if the calling task is already waiting on this
+              barrier.
+
+        """
+        await trio.lowlevel.checkpoint_if_cancelled()
+        if self._broken:
+            raise trio.BrokenResourceError("barrier is broken")
+        task = trio.lowlevel.current_task()
+        if task in self._waiters:
+            raise RuntimeError("this task is already waiting on the barrier")
+        while self._releasing:
+            await self._drain_lot.park()
+            if self._broken:
+                raise trio.BrokenResourceError("barrier is broken")
+        waiter = _BarrierWaiter(
+            generation=self._generation, index=len(self._waiters)
+        )
+        self._waiters[task] = waiter
+        if len(self._waiters) == self._parties:
+            # Last arrival releases the current generation.
+            self._release()
+            self._exit()
+            await trio.lowlevel.cancel_shielded_checkpoint()
+            return waiter.index
+        try:
+            await self._lot.park()
+        except trio.Cancelled:
+            # A cancelled waiter breaks its generation, waking the other
+            # tasks waiting in it. The generation check makes sure that
+            # late cleanup can't break a newer generation that reset()
+            # has already started.
+            if waiter.outcome is None and waiter.generation == self._generation:
+                self.abort()
+            self._waiters.pop(task, None)
+            if waiter.outcome == "released":
+                # The release already counted this task; keep the drain
+                # bookkeeping balanced.
+                self._exit()
+            raise
+        if waiter.outcome == "released":
+            self._exit()
+            return waiter.index
+        raise trio.BrokenResourceError("barrier was broken while waiting")

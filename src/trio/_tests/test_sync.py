@@ -730,3 +730,252 @@ async def test_lock_handover() -> None:
 
     assert lock._lot.broken_by == [child_task]
     assert not GLOBAL_PARKING_LOT_BREAKER
+
+
+async def test_Barrier_invalid_parties() -> None:
+    with pytest.raises(TypeError):
+        Barrier(1.5)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        Barrier("3")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        Barrier(0)
+    with pytest.raises(ValueError):
+        Barrier(-1)
+
+
+async def test_Barrier_basic() -> None:
+    barrier = Barrier(3)
+    assert barrier.parties == 3
+    assert not barrier.broken
+    assert barrier.statistics().tasks_waiting == 0
+    assert barrier.statistics().generation == 0
+    results = {}
+
+    async def waiter(name: str) -> None:
+        results[name] = await barrier.wait()
+
+    async with _core.open_nursery() as nursery:
+        for name in "abc":
+            nursery.start_soon(waiter, name)
+    # unique indices, exactly one coordinator (0) per generation
+    assert sorted(results.values()) == [0, 1, 2]
+    assert barrier.statistics().tasks_waiting == 0
+    assert barrier.statistics().generation == 1
+
+
+async def test_Barrier_checkpoint() -> None:
+    barrier = Barrier(1)
+    with assert_checkpoints():
+        assert await barrier.wait() == 0
+
+
+async def test_Barrier_reuse_multiple_rounds() -> None:
+    # Re-entering the barrier for further generations works. Because a
+    # generation takes some time to drain after being released, tasks
+    # looping into the next wait() also exercise the wait-during-release
+    # path, which must join the next generation rather than corrupt it.
+    barrier = Barrier(3)
+    log = []
+
+    async def worker(name: str) -> None:
+        for round_no in range(3):
+            log.append((name, round_no, await barrier.wait()))
+
+    async with _core.open_nursery() as nursery:
+        for name in "abc":
+            nursery.start_soon(worker, name)
+    for round_no in range(3):
+        assert sorted(idx for _, r, idx in log if r == round_no) == [0, 1, 2]
+    assert barrier.statistics().generation == 3
+    assert barrier.statistics().tasks_waiting == 0
+
+
+async def test_Barrier_same_task_reentry() -> None:
+    barrier = Barrier(2)
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(barrier.wait)
+        await wait_all_tasks_blocked()
+        # a task that is still registered as a waiter must not be able to
+        # wait again and corrupt the arrival count
+        barrier._waiters[_core.current_task()] = next(iter(barrier._waiters.values()))
+        with pytest.raises(RuntimeError, match="already waiting"):
+            await barrier.wait()
+        del barrier._waiters[_core.current_task()]
+        # the barrier is still intact and can complete the generation
+        assert await barrier.wait() == 1
+
+
+async def test_Barrier_waiter_cancellation_breaks_generation() -> None:
+    barrier = Barrier(3)
+    outcomes = []
+    cancel_scope = []
+
+    async def cancellable_waiter() -> None:
+        with _core.CancelScope() as scope:
+            cancel_scope.append(scope)
+            try:
+                await barrier.wait()
+                outcomes.append("released")
+            except _core.Cancelled:
+                outcomes.append("cancelled")
+                raise
+
+    async def waiter() -> None:
+        try:
+            await barrier.wait()
+            outcomes.append("released")
+        except _core.BrokenResourceError:
+            outcomes.append("broken")
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(cancellable_waiter)
+        nursery.start_soon(waiter)
+        await wait_all_tasks_blocked()
+        assert barrier.statistics().tasks_waiting == 2
+        cancel_scope[0].cancel()
+    # the cancelled task gets Cancelled; its generation-mates get
+    # BrokenResourceError
+    assert sorted(outcomes) == ["broken", "cancelled"]
+    assert barrier.broken
+    # abort does not advance the generation counter; only reset does
+    assert barrier.statistics().generation == 0
+    assert barrier.statistics().tasks_waiting == 0
+    # waiting on a broken barrier fails immediately
+    with pytest.raises(_core.BrokenResourceError):
+        await barrier.wait()
+    barrier.reset()
+    assert not barrier.broken
+    assert barrier.statistics().generation == 1
+
+
+async def test_Barrier_abort_and_reset() -> None:
+    barrier = Barrier(2)
+    outcomes = []
+
+    async def waiter() -> None:
+        try:
+            await barrier.wait()
+            outcomes.append("released")
+        except _core.BrokenResourceError:
+            outcomes.append("broken")
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(waiter)
+        await wait_all_tasks_blocked()
+        barrier.abort()
+        barrier.abort()  # aborting an already-broken barrier is a no-op
+    assert outcomes == ["broken"]
+    assert barrier.broken
+    barrier.reset()
+    assert not barrier.broken
+    assert barrier.statistics().generation == 1
+    # the barrier is reusable after reset
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(waiter)
+        nursery.start_soon(waiter)
+    assert outcomes == ["broken", "released", "released"]
+    assert barrier.statistics().generation == 2
+
+
+async def test_Barrier_cancel_racing_release() -> None:
+    # A waiter is cancelled (removing it from the parking lot) at the
+    # same moment as the last arrival releases its generation. The late
+    # Cancelled cleanup must still balance the release bookkeeping, and
+    # must not break the generation that the release already completed.
+    barrier = Barrier(2)
+    scope = _core.CancelScope()
+
+    async def waiter_a() -> None:
+        with scope:
+            await barrier.wait()
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(waiter_a)
+        await wait_all_tasks_blocked()
+        assert barrier.statistics().tasks_waiting == 1
+        scope.cancel()
+        # the main task is the last arrival; the release still counts the
+        # cancelled waiter's stale record
+        assert await barrier.wait() == 1
+    assert barrier.statistics().tasks_waiting == 0
+    assert barrier.statistics().generation == 1
+    assert not barrier.broken
+    # the barrier is still fully usable afterwards
+    results = []
+
+    async def waiter() -> None:
+        results.append(await barrier.wait())
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(waiter)
+        nursery.start_soon(waiter)
+    assert sorted(results) == [0, 1]
+    assert barrier.statistics().generation == 2
+
+
+async def test_Barrier_rounds_cancel_reset_reuse() -> None:
+    # Controlled scheduling: complete rounds 1 and 2, cancel the last
+    # arriver of round 3 before it can join, reset the broken generation,
+    # then complete round 4. Releases and failures of different rounds
+    # must not interfere with each other.
+    barrier = Barrier(3)
+    log = []
+    gate_c = Event()
+    c_cancelled = Event()
+    reset_done = Event()
+    c_scope = []
+
+    async def worker(name: str) -> None:
+        for round_no in (1, 2, 3, 4):
+            if name == "c" and round_no == 3:
+                scope = _core.CancelScope()
+                c_scope.append(scope)
+                await gate_c.wait()
+                with scope:
+                    try:
+                        await barrier.wait()
+                    except _core.Cancelled:
+                        log.append((name, round_no, "cancelled"))
+                        c_cancelled.set()
+                await reset_done.wait()
+                continue
+            try:
+                index = await barrier.wait()
+            except _core.BrokenResourceError:
+                log.append((name, round_no, "broken"))
+                if round_no == 3:
+                    await reset_done.wait()
+            else:
+                log.append((name, round_no, index))
+
+    async with _core.open_nursery() as nursery:
+        for name in "abc":
+            nursery.start_soon(worker, name)
+        # rounds 1 and 2 complete on their own; then a and b park in
+        # round 3 while c is held at the gate
+        await wait_all_tasks_blocked()
+        assert barrier.statistics().tasks_waiting == 2
+        assert barrier.statistics().generation == 2
+        # cancel the last arriver of round 3 before it joins
+        c_scope[0].cancel()
+        gate_c.set()
+        await c_cancelled.wait()
+        # the cancellation never joined the barrier, so the two parked
+        # waiters are still waiting and the barrier is not broken
+        assert barrier.statistics().tasks_waiting == 2
+        assert not barrier.broken
+        barrier.reset()
+        assert barrier.statistics().generation == 3
+        reset_done.set()
+    # rounds 1, 2 and 4 each released exactly one coordinator
+    for round_no in (1, 2, 4):
+        indices = sorted(entry[2] for entry in log if entry[1] == round_no)
+        assert indices == [0, 1, 2]
+    # round 3 failed for everyone involved, without cross-talk
+    assert sorted(entry for entry in log if entry[1] == 3) == [
+        ("a", 3, "broken"),
+        ("b", 3, "broken"),
+        ("c", 3, "cancelled"),
+    ]
+    assert barrier.statistics().generation == 4
+    assert barrier.statistics().tasks_waiting == 0
