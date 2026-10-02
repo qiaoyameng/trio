@@ -1,0 +1,1 @@
+`MemorySendChannel` and `MemoryReceiveChannel` now expose ``max_buffer_size`` as a settable property, with ``set_max_buffer_size()`` and ``resize()`` aliases, allowing a running memory channel's capacity to be changed without recreating either endpoint.

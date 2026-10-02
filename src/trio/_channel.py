@@ -44,6 +44,13 @@ elif "sphinx.ext.autodoc" in sys.modules:
         P = ParamSpec("P")
 
 
+def _validate_max_buffer_size(max_buffer_size: int | float) -> None:  # noqa: PYI041
+    if max_buffer_size != inf and not isinstance(max_buffer_size, int):
+        raise TypeError("max_buffer_size must be an integer or math.inf")
+    if max_buffer_size < 0:
+        raise ValueError("max_buffer_size must be >= 0")
+
+
 # written as a class so you can say open_memory_channel[int](5)
 @final
 class open_memory_channel(tuple["MemorySendChannel[T]", "MemoryReceiveChannel[T]"]):
@@ -104,10 +111,7 @@ class open_memory_channel(tuple["MemorySendChannel[T]", "MemoryReceiveChannel[T]
         cls,
         max_buffer_size: int | float,  # noqa: PYI041
     ) -> tuple[MemorySendChannel[T], MemoryReceiveChannel[T]]:
-        if max_buffer_size != inf and not isinstance(max_buffer_size, int):
-            raise TypeError("max_buffer_size must be an integer or math.inf")
-        if max_buffer_size < 0:
-            raise ValueError("max_buffer_size must be >= 0")
+        _validate_max_buffer_size(max_buffer_size)
         state: MemoryChannelState[T] = MemoryChannelState(max_buffer_size)
         return (
             MemorySendChannel[T]._create(state),
@@ -163,6 +167,19 @@ class MemoryChannelState(Generic[T]):
     # The largest len(self.data) has ever been
     peak_buffer_used: int = 0
 
+    def _admit_waiting_senders(self) -> None:
+        while self.send_tasks and len(self.data) < self.max_buffer_size:
+            task, value = self.send_tasks.popitem(last=False)
+            task.custom_sleep_data._tasks.remove(task)
+            self.data.append(value)
+            self.peak_buffer_used = max(self.peak_buffer_used, len(self.data))
+            trio.lowlevel.reschedule(task)
+
+    def set_max_buffer_size(self, max_buffer_size: int | float) -> None:  # noqa: PYI041
+        _validate_max_buffer_size(max_buffer_size)
+        self.max_buffer_size = max_buffer_size
+        self._admit_waiting_senders()
+
     def statistics(self) -> MemoryChannelStatistics:
         return MemoryChannelStatistics(
             current_buffer_used=len(self.data),
@@ -180,8 +197,9 @@ class MemoryChannelState(Generic[T]):
 class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
     """A memory channel endpoint for sending Python objects.
 
-    Instances of this class are created by
-    :func:`open_memory_channel` and cannot be instantiated directly.
+    Instances of this class are created by :func:`open_memory_channel` and
+    cannot be instantiated directly. All clones share the channel's mutable
+    :attr:`max_buffer_size`.
     """
 
     _state: MemoryChannelState[SendType]
@@ -203,6 +221,36 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
         # XX should we also report statistics specific to this object?
         return self._state.statistics()
 
+    @property
+    def max_buffer_size(self) -> int | float:
+        """The maximum number of items that can be buffered in this channel."""
+        return self._state.max_buffer_size
+
+    @max_buffer_size.setter
+    @enable_ki_protection
+    def max_buffer_size(self, max_buffer_size: int | float) -> None:  # noqa: PYI041
+        if self._closed:
+            raise trio.ClosedResourceError
+        self._state.set_max_buffer_size(max_buffer_size)
+
+    @enable_ki_protection
+    def set_max_buffer_size(
+        self, max_buffer_size: int | float
+    ) -> None:  # noqa: PYI041
+        """Change the maximum number of items buffered by this channel.
+
+        All clones share the same capacity. Decreasing capacity keeps all
+        values already accepted into the buffer; increasing capacity admits
+        waiting senders in FIFO order. A capacity of zero uses rendezvous
+        semantics.
+        """
+        self.max_buffer_size = max_buffer_size
+
+    @enable_ki_protection
+    def resize(self, max_buffer_size: int | float) -> None:  # noqa: PYI041
+        """Change this channel's maximum buffer size."""
+        self.set_max_buffer_size(max_buffer_size)
+
     @enable_ki_protection
     def send_nowait(self, value: SendType) -> None:
         """Like `~trio.abc.SendChannel.send`, but if the channel's buffer is
@@ -218,6 +266,8 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
             task, _ = self._state.receive_tasks.popitem(last=False)
             task.custom_sleep_data._tasks.remove(task)
             trio.lowlevel.reschedule(task, Value(value))
+        elif self._state.send_tasks:
+            raise trio.WouldBlock
         elif len(self._state.data) < self._state.max_buffer_size:
             self._state.data.append(value)
             self._state.peak_buffer_used = max(
@@ -338,8 +388,9 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
 class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstructor):
     """A memory channel endpoint for receiving Python objects.
 
-    Instances of this class are created by
-    :func:`open_memory_channel` and cannot be instantiated directly.
+    Instances of this class are created by :func:`open_memory_channel` and
+    cannot be instantiated directly. All clones share the channel's mutable
+    :attr:`max_buffer_size`.
     """
 
     _state: MemoryChannelState[ReceiveType]
@@ -354,6 +405,36 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
         associated with."""
         return self._state.statistics()
 
+    @property
+    def max_buffer_size(self) -> int | float:
+        """The maximum number of items that can be buffered in this channel."""
+        return self._state.max_buffer_size
+
+    @max_buffer_size.setter
+    @enable_ki_protection
+    def max_buffer_size(self, max_buffer_size: int | float) -> None:  # noqa: PYI041
+        if self._closed:
+            raise trio.ClosedResourceError
+        self._state.set_max_buffer_size(max_buffer_size)
+
+    @enable_ki_protection
+    def set_max_buffer_size(
+        self, max_buffer_size: int | float
+    ) -> None:  # noqa: PYI041
+        """Change the maximum number of items buffered by this channel.
+
+        All clones share the same capacity. Decreasing capacity keeps all
+        values already accepted into the buffer; increasing capacity admits
+        waiting senders in FIFO order. A capacity of zero uses rendezvous
+        semantics.
+        """
+        self.max_buffer_size = max_buffer_size
+
+    @enable_ki_protection
+    def resize(self, max_buffer_size: int | float) -> None:  # noqa: PYI041
+        """Change this channel's maximum buffer size."""
+        self.set_max_buffer_size(max_buffer_size)
+
     def __repr__(self) -> str:
         return (
             f"<receive channel at {id(self):#x}, using buffer at {id(self._state):#x}>"
@@ -367,14 +448,15 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
         """
         if self._closed:
             raise trio.ClosedResourceError
-        if self._state.send_tasks:
+        if self._state.send_tasks and not self._state.data:
             task, value = self._state.send_tasks.popitem(last=False)
             task.custom_sleep_data._tasks.remove(task)
-            trio.lowlevel.reschedule(task)
-            self._state.data.append(value)
-            # Fall through
+            trio.lowlevel.reschedule(task, Value(value))
+            return value
         if self._state.data:
-            return self._state.data.popleft()
+            value = self._state.data.popleft()
+            self._state._admit_waiting_senders()
+            return value
         if not self._state.open_send_channels:
             raise trio.EndOfChannel
         raise trio.WouldBlock

@@ -408,6 +408,212 @@ async def test_channel_fairness() -> None:
         assert (await r.receive()) == 2
 
 
+async def test_memory_channel_resize_shared_by_clones() -> None:
+    s, r = open_memory_channel[int](2)
+    s2 = s.clone()
+    r2 = r.clone()
+
+    s2.resize(3)
+    assert s.max_buffer_size == r.max_buffer_size == 3
+    assert s2.statistics().max_buffer_size == r2.statistics().max_buffer_size == 3
+
+    r.set_max_buffer_size(4)
+    assert s2.max_buffer_size == r2.max_buffer_size == 4
+
+    s.max_buffer_size = 5
+    assert r.max_buffer_size == 5
+
+    await s.aclose()
+    await r.aclose()
+    for endpoint in (s, r):
+        with pytest.raises(trio.ClosedResourceError):
+            endpoint.resize(6)
+    assert s2.max_buffer_size == r2.max_buffer_size == 5
+
+    s2.resize(6)
+    assert r2.max_buffer_size == 6
+
+
+async def test_memory_channel_resize_preserves_fifo_order() -> None:
+    s, r = open_memory_channel[int](3)
+    for value in range(3):
+        s.send_nowait(value)
+
+    completed: list[int] = []
+
+    async def blocked_send(value: int) -> None:
+        await s.send(value)
+        completed.append(value)
+
+    async with trio.open_nursery() as nursery:
+        for value in range(3, 6):
+            nursery.start_soon(blocked_send, value)
+        await wait_all_tasks_blocked()
+        waiting_values = list(s._state.send_tasks.values())
+        first, second, third = waiting_values
+
+        stats = s.statistics()
+        assert stats.current_buffer_used == 3
+        assert stats.max_buffer_size == 3
+        assert stats.tasks_waiting_send == 3
+
+        s.resize(1)
+        stats = r.statistics()
+        assert stats.max_buffer_size == 1
+        assert stats.current_buffer_used == 3
+        assert stats.tasks_waiting_send == 3
+        assert completed == []
+        with pytest.raises(trio.WouldBlock):
+            s.send_nowait(6)
+
+        r.set_max_buffer_size(4)
+        stats = s.statistics()
+        assert stats.current_buffer_used == 4
+        assert stats.tasks_waiting_send == 2
+        assert list(r._state.data) == [0, 1, 2, first]
+        await trio.sleep(0)
+        await wait_all_tasks_blocked()
+        assert completed == [first]
+
+        assert r.receive_nowait() == 0
+        assert list(r._state.data) == [1, 2, first, second]
+        assert s.statistics().tasks_waiting_send == 1
+        await wait_all_tasks_blocked()
+        assert completed == [first, second]
+
+        assert r.receive_nowait() == 1
+        assert list(r._state.data) == [2, first, second, third]
+        assert s.statistics().tasks_waiting_send == 0
+        await wait_all_tasks_blocked()
+        assert completed == [first, second, third]
+
+        assert [r.receive_nowait() for _ in range(4)] == [
+            2,
+            first,
+            second,
+            third,
+        ]
+
+
+async def test_memory_channel_resize_to_zero_keeps_rendezvous() -> None:
+    s, r = open_memory_channel[int](2)
+    s.send_nowait(1)
+    s.send_nowait(2)
+
+    completed = False
+
+    async def blocked_send() -> None:
+        nonlocal completed
+        await s.send(3)
+        completed = True
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(blocked_send)
+        await wait_all_tasks_blocked()
+
+        s.set_max_buffer_size(0)
+        assert [r.receive_nowait(), r.receive_nowait()] == [1, 2]
+        assert not completed
+        assert s.statistics().tasks_waiting_send == 1
+        with pytest.raises(trio.WouldBlock):
+            s.send_nowait(4)
+
+        assert r.receive_nowait() == 3
+        await wait_all_tasks_blocked()
+        assert completed
+
+        with pytest.raises(trio.WouldBlock):
+            s.send_nowait(5)
+
+
+async def test_memory_channel_invalid_resize_has_no_effect() -> None:
+    s, r = open_memory_channel[int](3)
+    for value in range(3):
+        s.send_nowait(value)
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(s.send, 3)
+        await wait_all_tasks_blocked()
+
+        r.resize(1)
+        before = s.statistics()
+        for invalid_capacity in (-1, 1.0, float("nan")):
+            with pytest.raises((TypeError, ValueError)):
+                s.set_max_buffer_size(invalid_capacity)
+        after = r.statistics()
+
+        assert after == before
+        assert after.max_buffer_size == 1
+        assert after.current_buffer_used == 3
+        assert after.tasks_waiting_send == 1
+        assert list(s._state.data) == [0, 1, 2]
+
+        nursery.cancel_scope.cancel()
+
+
+async def test_memory_channel_resize_then_close_does_not_duplicate_wakeups() -> None:
+    s, r = open_memory_channel[int](1)
+    s2 = s.clone()
+    s.send_nowait(0)
+
+    results: list[str] = []
+
+    async def blocked_send(
+        send_channel: trio.MemorySendChannel[int],
+        value: int,
+    ) -> None:
+        try:
+            await send_channel.send(value)
+        except trio.BrokenResourceError:
+            results.append(f"closed-{value}")
+        else:
+            results.append(f"sent-{value}")
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(blocked_send, s, 1)
+        nursery.start_soon(blocked_send, s2, 2)
+        nursery.start_soon(blocked_send, s, 3)
+        await wait_all_tasks_blocked()
+        first = next(iter(s._state.send_tasks.values()))
+
+        r.resize(2)
+        r.close()
+        await trio.sleep(0)
+
+    closed_values = {1, 2, 3} - {first}
+    assert results.count(f"sent-{first}") == 1
+    assert results.count(f"closed-{first}") == 0
+    assert set(results) == {f"sent-{first}"} | {
+        f"closed-{value}" for value in closed_values
+    }
+    assert s.statistics().tasks_waiting_send == 0
+    assert s2.statistics().tasks_waiting_send == 0
+
+
+async def test_memory_channel_resize_then_cancel_remaining_waiters() -> None:
+    s, r = open_memory_channel[int](1)
+    s.send_nowait(0)
+    completed: list[int] = []
+
+    async def blocked_send(value: int) -> None:
+        await s.send(value)
+        completed.append(value)
+
+    async with trio.open_nursery() as nursery:
+        for value in (1, 2, 3):
+            nursery.start_soon(blocked_send, value)
+        await wait_all_tasks_blocked()
+        first = next(iter(s._state.send_tasks.values()))
+
+        s.resize(2)
+        assert list(r._state.data) == [0, first]
+        assert s.statistics().tasks_waiting_send == 2
+        nursery.cancel_scope.cancel()
+
+    assert completed == [first]
+    assert s.statistics().tasks_waiting_send == 0
+
+
 async def test_unbuffered() -> None:
     s, r = open_memory_channel[int](0)
     with pytest.raises(trio.WouldBlock):
