@@ -2,7 +2,8 @@
 
 from typing import TYPE_CHECKING
 
-from trio import TASK_STATUS_IGNORED, Nursery, TaskStatus
+from trio import TASK_STATUS_IGNORED, Nursery, TaskHandle, TaskStatus
+from typing_extensions import assert_type
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -34,6 +35,9 @@ async def task_startable_1(
     *,
     task_status: TaskStatus[bool] = TASK_STATUS_IGNORED,
 ) -> None: ...
+
+
+async def task_returns_int() -> int: ...
 
 
 async def task_startable_2(
@@ -77,3 +81,17 @@ def check_start_soon(nursery: Nursery) -> None:
     nursery.start_soon(task_requires_kw, 12, True)  # type: ignore
     # Tasks following the start() API can be made to work.
     nursery.start_soon(task_startable_1, "cdf")
+
+
+async def check_start_soon_with_handle(nursery: Nursery) -> None:
+    """start_soon_with_handle() preserves the child's return type."""
+    handle = nursery.start_soon_with_handle(task_returns_int)
+    assert_type(handle, TaskHandle[int])
+    result = await handle.wait()
+    assert_type(result, int)
+    assert_type(handle.result(), int)
+    assert_type(handle.exception(), BaseException | None)
+
+    # Explicit annotation also works.
+    annotated: TaskHandle[int] = nursery.start_soon_with_handle(task_returns_int)
+    assert_type(annotated, TaskHandle[int])

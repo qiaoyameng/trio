@@ -1022,6 +1022,11 @@ The nursery API
 
    .. automethod:: start_soon(async_fn, *args, name = None)
 
+   .. automethod:: start_soon_with_handle(async_fn, *args, name = None)
+
+.. autoclass:: TaskHandle(RetT)
+   :members:
+
 .. attribute:: TASK_STATUS_IGNORED
    :type: TaskStatus
 

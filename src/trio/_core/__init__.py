@@ -35,6 +35,7 @@ from ._run import (
     Nursery,
     RunStatistics,
     Task,
+    TaskHandle,
     TaskStatus,
     add_instrument,
     checkpoint,

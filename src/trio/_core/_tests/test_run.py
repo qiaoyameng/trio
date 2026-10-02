@@ -229,6 +229,214 @@ async def test_child_crash_wakes_parent() -> None:
             await sleep_forever()
 
 
+async def test_start_soon_with_handle_returns_value() -> None:
+    sentinel = object()
+
+    async def child() -> object:
+        await _core.checkpoint()
+        return sentinel
+
+    async with _core.open_nursery() as nursery:
+        handle = nursery.start_soon_with_handle(child)
+        assert isinstance(handle, _core.TaskHandle)
+        assert not handle.done
+        with pytest.raises(RuntimeError, match="has not finished yet"):
+            handle.result()
+        with pytest.raises(RuntimeError, match="has not finished yet"):
+            handle.exception()
+
+        assert await handle.wait() is sentinel
+        assert handle.done
+        # The value can be read repeatedly, with identical identity.
+        assert handle.result() is sentinel
+        assert handle.exception() is None
+        assert await handle.wait() is sentinel
+
+
+async def test_start_soon_with_handle_two_waiters() -> None:
+    sentinel = object()
+
+    async def child() -> object:
+        await wait_all_tasks_blocked()
+        return sentinel
+
+    got: list[object] = []
+
+    async def waiter(handle: _core.TaskHandle[object]) -> None:
+        got.append(await handle.wait())
+
+    async with _core.open_nursery() as nursery:
+        handle = nursery.start_soon_with_handle(child)
+        nursery.start_soon(waiter, handle)
+        nursery.start_soon(waiter, handle)
+        await wait_all_tasks_blocked()
+        # Both waiters wake up once the child finishes, sharing the result.
+
+    assert got == [sentinel, sentinel]
+    assert got[0] is sentinel
+    assert got[1] is sentinel
+    assert handle.result() is sentinel
+
+
+async def test_start_soon_with_handle_cancelled_wait_keeps_child() -> None:
+    async def child() -> str:
+        await wait_all_tasks_blocked()
+        await wait_all_tasks_blocked()
+        return "done"
+
+    async with _core.open_nursery() as nursery:
+        handle = nursery.start_soon_with_handle(child)
+
+        with _core.CancelScope() as cs:
+            cs.cancel()
+            with pytest.raises(_core.Cancelled):
+                await handle.wait()
+
+        # Cancelling the wait did not cancel the child.
+        assert not handle.done
+        assert await handle.wait() == "done"
+
+        # Explicitly requesting cancellation after completion is a no-op.
+        handle.cancel()
+        assert handle.result() == "done"
+
+
+async def test_start_soon_with_handle_explicit_cancel() -> None:
+    # Cancelling via the handle only affects that one child; siblings keep
+    # running and the nursery does not raise.
+    record: list[str] = []
+
+    async def cancellable() -> None:
+        try:
+            await sleep_forever()
+        except _core.Cancelled:
+            record.append("cancelled")
+            raise
+
+    async def sibling() -> None:
+        await wait_all_tasks_blocked()
+        record.append("sibling alive")
+
+    async with _core.open_nursery() as nursery:
+        handle = nursery.start_soon_with_handle(cancellable)
+        sibling_handle = nursery.start_soon_with_handle(sibling)
+        await wait_all_tasks_blocked()
+
+        handle.cancel()
+        await wait_all_tasks_blocked()
+        # A cooperatively-cancelled task completes with None, not an error.
+        assert await handle.wait() is None
+        assert handle.done
+        assert handle.exception() is None
+
+        # The sibling is untouched; let it finish.
+        await sibling_handle.wait()
+
+    assert set(record) == {"cancelled", "sibling alive"}
+
+
+async def test_start_soon_with_handle_cancel_reason() -> None:
+    seen: list[_core.Cancelled] = []
+
+    async def child() -> None:
+        try:
+            await sleep_forever()
+        except _core.Cancelled as exc:
+            seen.append(exc)
+            raise
+
+    async with _core.open_nursery() as nursery:
+        handle = nursery.start_soon_with_handle(child)
+        await wait_all_tasks_blocked()
+        handle.cancel("because I said so")
+        await handle.wait()
+
+    assert len(seen) == 1
+    assert seen[0].reason == "because I said so"
+    assert seen[0].source == "explicit"
+
+
+async def test_start_soon_with_handle_failure() -> None:
+    my_exc = ValueError("uh oh")
+
+    async def crasher() -> NoReturn:
+        await _core.checkpoint()
+        raise my_exc
+
+    with pytest.RaisesGroup(
+        pytest.RaisesExc(check=lambda e: e is my_exc),
+    ):
+        async with _core.open_nursery() as nursery:
+            handle = nursery.start_soon_with_handle(crasher)
+
+            # Reading the failure through the handle ...
+            try:
+                await handle.wait()
+            except ValueError as got:
+                assert got is my_exc
+            else:
+                pytest.fail("handle.wait() should have raised")
+
+            # ... does not consume it: the same instance is readable again,
+            assert handle.exception() is my_exc
+            # and still propagates out of the nursery below.
+
+
+def test_start_soon_with_handle_closed_nursery() -> None:
+    async def child() -> None:
+        pass
+
+    async def main() -> None:
+        async with _core.open_nursery() as nursery:
+            pass
+        nursery.start_soon_with_handle(child)
+
+    with pytest.raises(RuntimeError, match="Nursery is closed to new arrivals"):
+        _core.run(main)
+
+
+def test_start_soon_with_handle_bad_callable() -> None:
+    async def main() -> None:
+        async with _core.open_nursery() as nursery:
+            nursery.start_soon_with_handle(lambda: None)  # type: ignore
+
+    with pytest.RaisesGroup(
+        pytest.RaisesExc(
+            TypeError,
+            match=r"expected an async function.*appears to be synchronous",
+        ),
+    ):
+        _core.run(main)
+
+
+def test_start_soon_with_handle_call_raises_in_child() -> None:
+    class Boom(Exception):
+        pass
+
+    async def main() -> None:
+        async with _core.open_nursery() as nursery:
+
+            async def async_fn() -> NoReturn:
+                raise Boom
+
+            handle = nursery.start_soon_with_handle(async_fn)
+            with pytest.raises(Boom):
+                await handle.wait()
+
+    with pytest.RaisesGroup(pytest.RaisesExc(check=lambda e: isinstance(e, Boom))):
+        _core.run(main)
+
+
+async def test_start_soon_with_handle_task_name() -> None:
+    async def my_child() -> None:
+        pass
+
+    async with _core.open_nursery() as nursery:
+        handle = nursery.start_soon_with_handle(my_child)
+        assert handle.task.name.endswith("my_child")
+        assert handle.task in nursery.child_tasks
+
+
 async def test_reschedule() -> None:
     t1: _core.Task | None = None
     t2: _core.Task | None = None

@@ -1,0 +1,6 @@
+`Nursery.start_soon_with_handle` now returns a `TaskHandle` for a spawned
+child task. The handle supports waiting for the child, reading its return
+value or exception, and requesting cancellation of that single child.
+It does not change nursery supervision: the nursery still owns the task and
+still propagates its exceptions, multiple waiters share one result, and
+cancelling a call to `TaskHandle.wait` cancels only that wait.

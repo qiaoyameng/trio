@@ -18,6 +18,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Final,
+    Generic,
     NoReturn,
     Protocol,
     cast,
@@ -45,7 +46,7 @@ from ._exceptions import (
 )
 from ._instrumentation import Instruments
 from ._ki import KIManager, enable_ki_protection
-from ._parking_lot import GLOBAL_PARKING_LOT_BREAKER
+from ._parking_lot import GLOBAL_PARKING_LOT_BREAKER, ParkingLot
 from ._run_context import GLOBAL_RUN_CONTEXT as GLOBAL_RUN_CONTEXT
 from ._thread_cache import start_thread_soon
 from ._traps import (
@@ -1070,6 +1071,146 @@ class _TaskStatus(TaskStatus[StatusT]):
         self._old_nursery._check_nursery_closed()
 
 
+def _compute_task_name(async_fn: object, name: object) -> str:
+    # Mirror the name-handling logic that used to live in spawn_impl, so
+    # e.g. wrappers can give their task the name of the wrapped function.
+    if name is None:
+        name = async_fn
+    if isinstance(name, functools.partial):
+        name = name.func
+    if not isinstance(name, str):
+        try:
+            return f"{name.__module__}.{name.__qualname__}"
+        except AttributeError:
+            return repr(name)
+    return name
+
+
+@final
+class TaskHandle(Generic[RetT], metaclass=NoPublicConstructor):
+    """A handle to a child task started in a `Nursery`.
+
+    Returned by `Nursery.start_soon_with_handle`. Unlike a "future" from
+    other libraries, a task handle does not affect task lifetime: the
+    child task is still owned and supervised by its nursery. The nursery
+    always waits for the child task to finish when it closes, and an
+    unhandled exception from the child still propagates out of the
+    nursery -- even if someone already observed that exception through
+    the handle. Dropping the handle has no effect on the child task.
+
+    A handle is shared-safe: any number of tasks may wait on it
+    concurrently, and they all observe the same result value or the same
+    exception instance. Cancelling a call to
+    :meth:`wait` (e.g. with a surrounding `CancelScope`) only cancels the
+    wait itself; it never cancels the child task. Use :meth:`cancel` to
+    request cancellation of the child task itself.
+
+    """
+
+    def __init__(self, task: Task, cancel_scope: CancelScope) -> None:
+        self._task = task
+        self._cancel_scope = cancel_scope
+        self._parking_lot = ParkingLot()
+        self._done = False
+        # We store the raw value/exception instead of an Outcome, because
+        # Outcome.unwrap() can only be called once, while any number of
+        # waiters must observe the same result.
+        self._value: RetT | None = None
+        self._error: BaseException | None = None
+
+    def __repr__(self) -> str:
+        return f"<TaskHandle {self._task.name!r} at {id(self):#x}>"
+
+    @property
+    def task(self) -> Task:
+        """(`~trio.lowlevel.Task`): The child task this handle refers to."""
+        return self._task
+
+    @property
+    def done(self) -> bool:
+        """Whether the child task has finished.
+
+        A task that was cancelled (and let `Cancelled` propagate, as
+        usual) is considered done, with a result of ``None``.
+        """
+        return self._done
+
+    def _set_outcome(self, outcome: Outcome[RetT]) -> None:
+        # Called exactly once, from the runner when the child task exits.
+        assert not self._done
+        self._done = True
+        if isinstance(outcome, Error):
+            self._error = outcome.error
+        else:
+            self._value = outcome.value
+        self._parking_lot.unpark_all()
+
+    def _unwrap(self) -> RetT:
+        if self._error is not None:
+            raise self._error
+        return self._value  # type: ignore[return-value]
+
+    async def wait(self) -> RetT:
+        """Wait for the child task to finish, then return its result.
+
+        If the child task raised an exception (other than `Cancelled`),
+        then it is re-raised here. Reading the exception does not consume
+        it: the nursery still propagates it when the nursery closes.
+
+        Cancelling this call cancels only the wait, not the child task.
+        Multiple concurrent callers all receive the same value or the
+        same exception instance.
+        """
+        if not self._done:
+            await self._parking_lot.park()
+        return self._unwrap()
+
+    def result(self) -> RetT:
+        """Return the child task's result without blocking.
+
+        Raises:
+          RuntimeError: if the child task has not finished yet.
+        """
+        if not self.done:
+            raise RuntimeError("child task has not finished yet")
+        return self._unwrap()
+
+    def exception(self) -> BaseException | None:
+        """Return the exception raised by the child task, without blocking.
+
+        Returns ``None`` if the task finished normally (including being
+        cancelled in the usual way). The returned exception is the same
+        instance that the nursery will propagate.
+
+        Raises:
+          RuntimeError: if the child task has not finished yet.
+        """
+        if not self.done:
+            raise RuntimeError("child task has not finished yet")
+        return self._error
+
+    def cancel(
+        self,
+        reason: str | None = None,
+    ) -> None:
+        """Request cancellation of this child task.
+
+        This cancels the per-task `CancelScope` surrounding the child
+        task, so only this task is affected; sibling tasks and the
+        nursery itself keep running. The nursery still waits for the task
+        to actually finish when the nursery closes.
+
+        If the task has already finished, this is a no-op.
+
+        Args:
+          reason: An optional string attached to the resulting
+              :exc:`Cancelled`, to explain where the cancellation came
+              from.
+        """
+        if not self.done:
+            self._cancel_scope.cancel(reason)
+
+
 @attrs.define(slots=False)
 class NurseryManager:
     """Nursery context manager.
@@ -1227,6 +1368,9 @@ class Nursery(metaclass=NoPublicConstructor):
         self._parent_waiting_in_aexit = False
         self._pending_starts = 0
         self._closed = False
+        # Handles handed out by start_soon_with_handle(), keyed by the
+        # spawned task. Popped when the task finishes.
+        self._task_handles: dict[Task, TaskHandle[Any]] = {}
 
     @property
     def child_tasks(self) -> frozenset[Task]:
@@ -1255,10 +1399,17 @@ class Nursery(metaclass=NoPublicConstructor):
         task: Task,
         outcome: Outcome[object],
     ) -> None:
+        handle = self._task_handles.pop(task, None)
         self._children.remove(task)
         if self._closed and not hasattr(self, "_pending_excs"):
             # We're abandoned by misnested nurseries, the result of the task is lost.
+            if handle is not None:
+                handle._set_outcome(
+                    cast("Outcome[Any]", Error(RuntimeError("nursery closed"))),
+                )
             return
+        if handle is not None:
+            handle._set_outcome(cast("Outcome[Any]", outcome))
         if isinstance(outcome, Error):
             self._add_exc(
                 outcome.error,
@@ -1383,6 +1534,69 @@ class Nursery(metaclass=NoPublicConstructor):
                           exited).
         """
         GLOBAL_RUN_CONTEXT.runner.spawn_impl(async_fn, args, self, name)
+
+    def start_soon_with_handle(
+        self,
+        async_fn: Callable[[Unpack[PosArgT]], Awaitable[RetT]],
+        *args: Unpack[PosArgT],
+        name: object = None,
+    ) -> TaskHandle[RetT]:
+        """Creates a child task like :meth:`start_soon`, but returns a
+        :class:`TaskHandle` that can be used to wait for the task and read
+        its return value or exception.
+
+        This does *not* change how the nursery supervises the child task:
+        the nursery still waits for it on exit and still propagates its
+        exception. Reading an exception via the handle does not swallow
+        it, and dropping the handle does not detach the task. The handle
+        is thus a view onto a nursery child, not a standalone future.
+
+        Each child gets its own `CancelScope`, so requesting cancellation
+        via the handle only affects that one task.
+
+        Args:
+            async_fn: An async callable.
+            args: Positional arguments for ``async_fn``. If you want
+                  to pass keyword arguments, use
+                  :func:`functools.partial`.
+            name: The name for this task. Only used for
+                  debugging/introspection
+                  (e.g. ``repr(task_obj)``).
+
+        Raises:
+            RuntimeError: If this nursery is no longer open
+                          (i.e. its ``async with`` block has
+                          exited).
+            TypeError: If ``async_fn`` is not an async callable.
+        """
+        if self._closed:
+            raise RuntimeError("Nursery is closed to new arrivals")
+
+        spawn_name = _compute_task_name(async_fn, name)
+        # Each handle child gets its own cancel scope, nested inside the
+        # nursery's scope (like all of its children). Cancelling *this*
+        # scope only affects this one task; the nursery scope -- and any
+        # scope surrounding it -- still cancel the task in the usual way.
+        cancel_scope = CancelScope()
+
+        async def _run_with_handle() -> RetT:
+            # Call async_fn inside the task, so an error raised while
+            # invoking it (wrong args, etc.) is reported through the task
+            # (and thus the nursery), rather than escaping from the spawn
+            # call and leaving a half-created handle behind.
+            with cancel_scope:
+                coro = coroutine_or_error(async_fn, *args)
+                return await coro
+
+        task = GLOBAL_RUN_CONTEXT.runner.spawn_impl(
+            _run_with_handle,
+            (),
+            self,
+            spawn_name,
+        )
+        handle: TaskHandle[RetT] = TaskHandle._create(task, cancel_scope)
+        self._task_handles[task] = handle
+        return handle
 
     # Typing changes blocked by https://github.com/python/mypy/pull/17512
     async def start(  # type: ignore[explicit-any]
@@ -1965,15 +2179,7 @@ class Runner:  # type: ignore[explicit-any]
         # TypeVarTuple passed into ParamSpec function confuses Mypy.
         coro = context.run(coroutine_or_error, async_fn, *args)  # type: ignore[arg-type]
 
-        if name is None:
-            name = async_fn
-        if isinstance(name, functools.partial):
-            name = name.func
-        if not isinstance(name, str):
-            try:
-                name = f"{name.__module__}.{name.__qualname__}"  # type: ignore[attr-defined]
-            except AttributeError:
-                name = repr(name)
+        name = _compute_task_name(async_fn, name)
 
         # very old Cython versions (<0.29.24) has the attribute, but with a value of None
         if getattr(coro, "cr_frame", None) is None:
