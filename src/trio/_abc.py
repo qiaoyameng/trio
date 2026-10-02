@@ -670,6 +670,12 @@ class ReceiveChannel(AsyncResource, Generic[ReceiveType]):
         Raises:
           trio.EndOfChannel: if the sender has been closed cleanly, and no
               more objects are coming. This is not an error condition.
+          trio.ChannelClosedWithError: on memory channels, if a sender
+              terminated the channel early with
+              :meth:`trio.MemorySendChannel.close_with_error`, once any
+              buffered objects have been delivered. Subclasses
+              `~trio.EndOfChannel`, so it can be handled the same way when
+              the reason is not needed.
           trio.ClosedResourceError: if you previously closed this
               :class:`ReceiveChannel` object.
           trio.BrokenResourceError: if something has gone wrong, and the

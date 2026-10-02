@@ -1,0 +1,10 @@
+`MemorySendChannel` now has a `~trio.MemorySendChannel.close_with_error`
+method for terminating a memory channel when a producer fails. Any send
+clone may call it; the first failure closes every clone and wins. Buffered
+values are still delivered, and receivers then get the new
+`~trio.ChannelClosedWithError` exception (a subclass of `~trio.EndOfChannel`)
+that carries the original reason in its ``reason`` attribute and
+``__cause__`` chain. Tasks blocked in ``send`` are woken immediately with
+`~trio.BrokenResourceError`. Plain ``close`` keeps its existing
+reference-counted semantics, and closing the receive side first continues to
+take priority.

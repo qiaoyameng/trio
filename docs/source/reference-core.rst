@@ -1300,6 +1300,38 @@ adding a ``break`` statement to the ``async for`` loop – you should
 see a :exc:`BrokenResourceError` from the producer.
 
 
+Terminating a channel with an error
++++++++++++++++++++++++++++++++++++
+
+A plain close is a *clean* shutdown: it means every producer finished
+normally and the consumer eventually sees :exc:`EndOfChannel`. But what if
+a producer fails partway through and wants to tell the consumers to stop
+because the remaining values will never arrive? For this, use
+:meth:`MemorySendChannel.close_with_error`::
+
+   try:
+       ...  # produce values
+   except BaseException as exc:
+       send_channel.close_with_error(exc)
+       raise
+
+Any send clone can make this call; the first failure terminates the whole
+channel for every clone, and later failures (or plain closes) never replace
+the recorded reason. Values already sent are delivered first – they are not
+lost behind the failure – and once they are drained, calls to
+:meth:`~trio.abc.ReceiveChannel.receive` raise
+:exc:`ChannelClosedWithError`. This is a subclass of :exc:`EndOfChannel`
+that carries the original exception both as ``exc.reason`` and through the
+standard ``__cause__`` chain, so existing ``async for`` loops keep working
+while code that cares can distinguish an upstream failure from a normal end
+of stream.
+
+Tasks blocked in :meth:`~trio.abc.SendChannel.send` are woken immediately
+with :exc:`BrokenResourceError`. If the receive side was already closed,
+then that close takes priority: buffered values are discarded as usual and
+the failure reason is not delivered to anyone.
+
+
 .. _channel-mpmc:
 
 Managing multiple producers and/or multiple consumers
@@ -2093,6 +2125,8 @@ Exceptions and warnings
 .. autoexception:: WouldBlock
 
 .. autoexception:: EndOfChannel
+
+.. autoexception:: ChannelClosedWithError
 
 .. autoexception:: BusyResourceError
 

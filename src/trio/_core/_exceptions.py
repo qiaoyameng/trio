@@ -167,3 +167,31 @@ class EndOfChannel(Exception):
     This is analogous to an "end-of-file" condition, but for channels.
 
     """
+
+
+class ChannelClosedWithError(EndOfChannel):
+    """Raised when trying to receive from a memory channel that was closed
+    with an error, after all buffered values have been delivered.
+
+    Unlike :exc:`EndOfChannel`, which signals a clean shutdown once every
+    producer has finished, this exception means a producer failed and
+    explicitly terminated the channel early using
+    :meth:`trio.MemorySendChannel.close_with_error`.
+
+    It subclasses :exc:`EndOfChannel` so existing code that handles clean
+    shutdown keeps working; use the subclass to distinguish an upstream
+    failure from a normal end of stream.
+
+    The exception that caused the producer to terminate is available both as
+    :attr:`reason` and via the standard ``__cause__`` chain.
+
+    Attributes:
+      reason (BaseException): The exception passed to
+          :meth:`trio.MemorySendChannel.close_with_error`.
+
+    """
+
+    def __init__(self, reason: BaseException) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.__cause__ = reason

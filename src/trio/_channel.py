@@ -17,7 +17,14 @@ from outcome import Error, Value
 import trio
 
 from ._abc import ReceiveChannel, ReceiveType, SendChannel, SendType, T
-from ._core import Abort, BrokenResourceError, RaiseCancelT, Task, enable_ki_protection
+from ._core import (
+    Abort,
+    BrokenResourceError,
+    ChannelClosedWithError,
+    RaiseCancelT,
+    Task,
+    enable_ki_protection,
+)
 from ._util import (
     MultipleExceptionError,
     NoPublicConstructor,
@@ -156,12 +163,20 @@ class MemoryChannelState(Generic[T]):
     # Counts of open endpoints using this state
     open_send_channels: int = 0
     open_receive_channels: int = 0
+    # All currently-open send/receive channel objects sharing this state.
+    # Used to mark every clone closed when the channel is terminated with an
+    # error by any single send clone.
+    send_channels: set[MemorySendChannel[T]] = attrs.Factory(set)
+    receive_channels: set[MemoryReceiveChannel[T]] = attrs.Factory(set)
     # {task: value}
     send_tasks: OrderedDict[Task, T] = attrs.Factory(OrderedDict)
     # {task: None}
     receive_tasks: OrderedDict[Task, None] = attrs.Factory(OrderedDict)
     # The largest len(self.data) has ever been
     peak_buffer_used: int = 0
+    # Set once any sender terminates the channel with an error. After this,
+    # drained receive() calls raise ChannelClosedWithError(reason).
+    close_error: BaseException | None = None
 
     def statistics(self) -> MemoryChannelStatistics:
         return MemoryChannelStatistics(
@@ -193,6 +208,7 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
 
     def __attrs_post_init__(self) -> None:
         self._state.open_send_channels += 1
+        self._state.send_channels.add(self)
 
     def __repr__(self) -> str:
         return f"<send channel at {id(self):#x}, using buffer at {id(self._state):#x}>"
@@ -211,6 +227,8 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
         """
         if self._closed:
             raise trio.ClosedResourceError
+        if self._state.close_error is not None:
+            raise trio.BrokenResourceError from self._state.close_error
         if self._state.open_receive_channels == 0:
             raise trio.BrokenResourceError
         if self._state.receive_tasks:
@@ -312,17 +330,108 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
         if self._closed:
             return
         self._closed = True
+        self._state.send_channels.discard(self)
         for task in self._tasks:
             trio.lowlevel.reschedule(task, Error(trio.ClosedResourceError()))
             del self._state.send_tasks[task]
         self._tasks.clear()
         self._state.open_send_channels -= 1
-        if self._state.open_send_channels == 0:
+        if self._state.close_error is not None:
+            # A prior close_with_error already finished shutdown; a plain
+            # close must not overwrite the recorded failure.
+            pass
+        elif self._state.open_send_channels == 0:
             assert not self._state.send_tasks
             for task in self._state.receive_tasks:
                 task.custom_sleep_data._tasks.remove(task)
                 trio.lowlevel.reschedule(task, Error(trio.EndOfChannel()))
             self._state.receive_tasks.clear()
+
+    @enable_ki_protection
+    def close_with_error(self, reason: BaseException) -> None:
+        """Terminate this memory channel because producing values failed.
+
+        Any open clone of the send side may call this; the first call wins
+        and terminates the *whole* channel for every clone. Already-buffered
+        values are delivered first; once those are drained, receivers get
+        `trio.ChannelClosedWithError`, a subclass of `~trio.EndOfChannel`
+        carrying *reason* (both as ``exc.reason`` and via ``__cause__``)
+        instead of a plain end-of-channel.
+
+        Tasks blocked in `send` (on any clone) are immediately woken with
+        `~trio.BrokenResourceError` chained from *reason*, and every send
+        clone becomes closed, so later ``send``/``clone`` calls raise
+        `~trio.ClosedResourceError`.
+
+        Later failures never replace the recorded reason: subsequent calls
+        (including from other clones) are no-ops that raise
+        `~trio.ClosedResourceError`. A plain `close` afterwards likewise does
+        not overwrite the failure.
+
+        Closing the receive side first still takes priority: if no receive
+        channels remain then buffered data is discarded and blocked senders
+        are woken as usual, and *reason* is not surfaced to anyone.
+
+        Args:
+          reason (BaseException): The upstream failure that caused the
+              channel to terminate early.
+
+        Raises:
+          trio.ClosedResourceError: if this object was already closed, or
+              the channel was already terminated (cleanly or with an error).
+          TypeError: if *reason* is not an exception instance.
+
+        """
+        if not isinstance(reason, BaseException):
+            raise TypeError("reason must be an exception instance")
+        if self._closed:
+            raise trio.ClosedResourceError
+
+        state = self._state
+        if state.open_receive_channels == 0:
+            # Receivers gave up first. Receiver-close semantics win: behave
+            # exactly like a plain close (which wakes blocked senders with
+            # BrokenResourceError), don't mark peer clones closed, and never
+            # record a failure that nobody could observe.
+            self.close()
+            return
+
+        # First failure wins: close every send clone atomically.
+        peer_channels = set(state.send_channels)
+        for channel in peer_channels:
+            channel._closed = True
+            state.send_channels.discard(channel)
+
+        # Release blocked senders promptly; their in-flight values are not
+        # delivered once the stream has failed.
+        blocked_senders = [
+            (task, task.custom_sleep_data) for task in state.send_tasks
+        ]
+        for task, channel in blocked_senders:
+            channel._tasks.discard(task)
+            error = trio.BrokenResourceError()
+            error.__cause__ = reason
+            trio.lowlevel.reschedule(task, Error(error))
+        state.send_tasks.clear()
+        state.open_send_channels = 0
+
+        state.close_error = reason
+
+        # Keep buffered values so they are delivered before the terminal
+        # error. Only wake receivers that cannot pull a buffered value now.
+        if not state.data:
+            blocked_receivers = [
+                (task, task.custom_sleep_data) for task in state.receive_tasks
+            ]
+            for task, channel in blocked_receivers:
+                channel._tasks.discard(task)
+                trio.lowlevel.reschedule(
+                    task,
+                    Error(ChannelClosedWithError(reason).with_traceback(None)),
+                )
+            state.receive_tasks.clear()
+
+    close_with_reason = close_with_error
 
     @enable_ki_protection
     async def aclose(self) -> None:
@@ -348,6 +457,7 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
 
     def __attrs_post_init__(self) -> None:
         self._state.open_receive_channels += 1
+        self._state.receive_channels.add(self)
 
     def statistics(self) -> MemoryChannelStatistics:
         """Returns a `MemoryChannelStatistics` for the memory channel this is
@@ -375,6 +485,8 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
             # Fall through
         if self._state.data:
             return self._state.data.popleft()
+        if self._state.close_error is not None:
+            raise ChannelClosedWithError(self._state.close_error)
         if not self._state.open_send_channels:
             raise trio.EndOfChannel
         raise trio.WouldBlock
@@ -470,6 +582,7 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
         if self._closed:
             return
         self._closed = True
+        self._state.receive_channels.discard(self)
         for task in self._tasks:
             trio.lowlevel.reschedule(task, Error(trio.ClosedResourceError()))
             del self._state.receive_tasks[task]

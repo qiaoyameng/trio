@@ -427,6 +427,219 @@ async def test_unbuffered() -> None:
         r.receive_nowait()
 
 
+async def test_close_with_error_basic() -> None:
+    s, r = open_memory_channel[int](10)
+    await s.send(1)
+    await s.send(2)
+    reason = ValueError("producer failed")
+    s.close_with_error(reason)
+
+    # Buffered values are delivered first; the terminal error comes last.
+    assert await r.receive() == 1
+    assert r.receive_nowait() == 2
+    with pytest.raises(trio.ChannelClosedWithError) as excinfo:
+        await r.receive()
+    exc = excinfo.value
+    assert isinstance(exc, EndOfChannel)
+    assert exc.reason is reason
+    assert exc.__cause__ is reason
+
+    # Every send clone is closed; reuse raises ClosedResourceError.
+    with pytest.raises(trio.ClosedResourceError):
+        await s.send(3)
+    with pytest.raises(trio.ClosedResourceError):
+        s.send_nowait(3)
+    with pytest.raises(trio.ClosedResourceError):
+        s.clone()
+    # Repeating the failure is a no-op that does not change the reason.
+    with pytest.raises(trio.ClosedResourceError):
+        s.close_with_error(ValueError("later"))
+    with pytest.raises(trio.ChannelClosedWithError) as excinfo2:
+        r.receive_nowait()
+    assert excinfo2.value.reason is reason
+
+
+async def test_close_with_error_scenario() -> None:
+    # The headline scenario: two buffered items, one clone aborts the whole
+    # channel while another clone is blocked sending; multiple receive clones
+    # must eventually see the failure after the last buffered item.
+    s, r = open_memory_channel[str](2)
+    s_abort = s.clone()
+    s_blocked = s.clone()
+    s.close()
+    r2 = r.clone()
+
+    s_abort.send_nowait("one")
+    s_abort.send_nowait("two")
+
+    blocked_outcome: object = None
+
+    async def blocked_send() -> None:
+        nonlocal blocked_outcome
+        try:
+            await s_blocked.send("three")
+        except BaseException as exc:  # noqa: BLE001  # we want any outcome
+            blocked_outcome = exc
+
+    reason = RuntimeError("boom")
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(blocked_send)
+        await wait_all_tasks_blocked()
+        assert s_abort.statistics().tasks_waiting_send == 1
+
+        # A *different* clone terminates the whole channel.
+        s_abort.close_with_error(reason)
+        await wait_all_tasks_blocked()
+
+        # The blocked sender is released promptly with the cause attached.
+        assert isinstance(blocked_outcome, trio.BrokenResourceError)
+        assert blocked_outcome.__cause__ is reason
+        with pytest.raises(trio.ClosedResourceError):
+            s_blocked.send_nowait("late")
+
+        # Buffered data is drained first, then the terminal exception.
+        drained = [await r.receive(), await r.receive()]
+        assert drained == ["one", "two"]
+        with pytest.raises(trio.ChannelClosedWithError) as excinfo:
+            await r.receive()
+        assert excinfo.value.reason is reason
+
+        # Other receive clones observe the same reason with nothing left.
+        for recv_clone in (r2, r.clone()):
+            with pytest.raises(trio.ChannelClosedWithError) as other_exc:
+                await recv_clone.receive()
+            assert other_exc.value.reason is reason
+            assert isinstance(other_exc.value, EndOfChannel)
+
+
+async def test_close_with_error_first_reason_wins() -> None:
+    s, r = open_memory_channel[int](0)
+    s2 = s.clone()
+    first = KeyError("first")
+    s.close_with_error(first)
+
+    # A later, different failure on another clone cannot overwrite it.
+    with pytest.raises(trio.ClosedResourceError):
+        s2.close_with_error(ValueError("second"))
+    with pytest.raises(trio.ChannelClosedWithError) as excinfo:
+        await r.receive()
+    assert excinfo.value.reason is first
+
+
+async def test_close_with_error_wakes_waiting_receivers() -> None:
+    s, r = open_memory_channel[int](0)
+    seen: list[BaseException] = []
+
+    async def wait_receive() -> None:
+        try:
+            await r.receive()
+        except BaseException as exc:  # noqa: BLE001
+            seen.append(exc)
+
+    async with trio.open_nursery() as nursery:
+        for _ in range(3):
+            nursery.start_soon(wait_receive)
+        await wait_all_tasks_blocked()
+        assert r.statistics().tasks_waiting_receive == 3
+        reason = LookupError("gone")
+        s.close_with_error(reason)
+
+    assert len(seen) == 3
+    assert all(isinstance(exc, trio.ChannelClosedWithError) for exc in seen)
+    assert all(exc.reason is reason for exc in seen)
+
+
+async def test_close_with_error_keeps_buffered_for_waiting_receiver() -> None:
+    s, r = open_memory_channel[int](2)
+    s.send_nowait(42)
+    got: list[int] = []
+
+    async def wait_receive() -> None:
+        got.append(await r.receive())
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(wait_receive)
+        await wait_all_tasks_blocked()
+        # The waiting receiver must grab the buffered item instead of being
+        # woken with the failure.
+        s.close_with_error(RuntimeError("after buffer"))
+        await wait_all_tasks_blocked()
+        assert got == [42]
+
+    with pytest.raises(trio.ChannelClosedWithError):
+        await r.receive()
+
+
+async def test_close_with_error_wakes_blocked_senders() -> None:
+    s, r = open_memory_channel[int](0)
+    s2 = s.clone()
+    outcomes: list[BaseException] = []
+
+    async def blocked_send(channel: trio.MemorySendChannel[int]) -> None:
+        try:
+            await channel.send(1)
+        except BaseException as exc:  # noqa: BLE001
+            outcomes.append(exc)
+
+    reason = RuntimeError("upstream")
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(blocked_send, s)
+        nursery.start_soon(blocked_send, s2)
+        await wait_all_tasks_blocked()
+        assert r.statistics().tasks_waiting_send == 2
+        s.close_with_error(reason)
+
+    assert len(outcomes) == 2
+    assert all(isinstance(exc, trio.BrokenResourceError) for exc in outcomes)
+    assert all(exc.__cause__ is reason for exc in outcomes)
+    assert r.statistics().tasks_waiting_send == 0
+
+
+async def test_close_with_error_after_receivers_closed() -> None:
+    # Receiver-side shutdown wins and is never replaced by a failure reason.
+    s, r = open_memory_channel[int](1)
+    s2 = s.clone()
+    await s.send(1)
+    await r.aclose()
+
+    s.close_with_error(RuntimeError("too late"))
+    assert s._state.close_error is None
+    assert s._closed
+    # Peer clones are not force-closed; they see ordinary receiver-gone errors.
+    assert not s2._closed
+    with pytest.raises(trio.BrokenResourceError):
+        await s2.send(2)
+
+
+async def test_close_with_error_validation() -> None:
+    s, _r = open_memory_channel[int](0)
+    with pytest.raises(TypeError):
+        s.close_with_error("not an exception")  # type: ignore[arg-type]
+    s.close()
+    with pytest.raises(trio.ClosedResourceError):
+        s.close_with_error(RuntimeError("closed"))
+
+
+async def test_close_with_error_then_plain_close_keeps_reason() -> None:
+    s, r = open_memory_channel[int](0)
+    s2 = s.clone()
+    s.close_with_error(RuntimeError("first"))
+    # Plain closes afterwards do not overwrite the recorded failure.
+    s.close()
+    s2.close()
+    with pytest.raises(trio.ChannelClosedWithError) as excinfo:
+        await r.receive()
+    assert isinstance(excinfo.value.reason, RuntimeError)
+
+
+async def test_async_for_after_close_with_error() -> None:
+    s, r = open_memory_channel[int](1)
+    s.send_nowait(1)
+    s.close_with_error(RuntimeError("ignored by async for"))
+    # Subclassing EndOfChannel keeps async-for iteration working.
+    assert [value async for value in r] == [1]
+
+
 async def test_as_safe_channel_exhaust() -> None:
     @as_safe_channel
     async def agen() -> AsyncGenerator[int]:
