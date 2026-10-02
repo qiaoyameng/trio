@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import operator
+from collections import deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from math import inf, isfinite, isnan
 from typing import TypeAlias, TypeVar
 
-from .. import _core, _util
+from .. import Event, _core, _util
 from .._highlevel_generic import StapledStream
+from .._timeouts import sleep_until
 from ..abc import ReceiveStream, SendStream
 
 AsyncHook: TypeAlias = Callable[[], Awaitable[object]]
@@ -13,6 +17,278 @@ AsyncHook: TypeAlias = Callable[[], Awaitable[object]]
 SyncHook: TypeAlias = Callable[[], object]
 SendStreamT = TypeVar("SendStreamT", bound=SendStream)
 ReceiveStreamT = TypeVar("ReceiveStreamT", bound=ReceiveStream)
+
+
+@dataclass(eq=False)
+class _ScheduledItem:
+    ready_at: float
+    data: bytes | None
+
+    @property
+    def is_eof(self) -> bool:
+        return self.data is None
+
+
+@dataclass(eq=False)
+class _TimedMemoryLink:
+    delay: float
+    bytes_per_second: float
+    max_buffer_size: int | float
+
+    def __post_init__(self) -> None:
+        self.send_closed = False
+        self.receive_closed = False
+        self._scheduled: deque[_ScheduledItem] = deque()
+        self._ready_buffer = bytearray()
+        self._ready_eof = False
+        self._next_send_at = -inf
+        self._accepted_bytes = 0
+        self._receiver_waiting = False
+        self._flow_lot = _core.ParkingLot()
+        self._data_event: Event | None = None
+        self._send_conflict_detector: _util.ConflictDetector = (
+            _util.ConflictDetector(
+                "another task is using this stream",
+            )
+        )
+        self._receive_conflict_detector: _util.ConflictDetector = (
+            _util.ConflictDetector(
+                "another task is using this stream",
+            )
+        )
+
+    def _pump(self) -> None:
+        now = _core.current_time()
+        while self._scheduled and self._scheduled[0].ready_at <= now:
+            item = self._scheduled.popleft()
+            if item.is_eof:
+                self._ready_eof = True
+            else:
+                assert item.data is not None
+                self._ready_buffer += item.data
+        if self._ready_buffer or self._ready_eof:
+            self._notify_data()
+
+    def _drain_ready_buffer(self, max_bytes: int | None) -> bytes | None:
+        if not self._ready_buffer:
+            return None
+        if max_bytes is None:
+            data = bytes(self._ready_buffer)
+            self._ready_buffer.clear()
+        else:
+            data = bytes(self._ready_buffer[:max_bytes])
+            del self._ready_buffer[: len(data)]
+        self._accepted_bytes -= len(data)
+        return data
+
+    def _notify_data(self) -> None:
+        if self._data_event is not None:
+            self._data_event.set()
+
+    def _next_ready_at(self) -> float | None:
+        if not self._scheduled:
+            return None
+        return self._scheduled[0].ready_at
+
+    def _enqueue(
+        self,
+        data: bytes | None,
+        now: float | None = None,
+    ) -> None:
+        if now is None:
+            now = _core.current_time()
+        ready_at = now + self.delay
+        self._scheduled.append(_ScheduledItem(ready_at, data))
+        if data:
+            self._accepted_bytes += len(data)
+            if self.bytes_per_second == inf:
+                self._next_send_at = max(self._next_send_at, now)
+        self._notify_data()
+
+    async def send_all(self, data: bytes | bytearray | memoryview) -> None:
+        with self._send_conflict_detector:
+            await _core.checkpoint()
+            await _core.checkpoint()
+            if self.send_closed:
+                raise _core.ClosedResourceError
+            if self.receive_closed:
+                raise _core.BrokenResourceError
+
+            offset = 0
+            now = _core.current_time()
+            view = memoryview(data)
+            while offset < len(data):
+                if self.receive_closed:
+                    raise _core.BrokenResourceError
+                if self.send_closed:
+                    raise _core.ClosedResourceError
+                if self.max_buffer_size == inf:
+                    chunk = bytes(view[offset:])
+                elif self.max_buffer_size == 0:
+                    if not self._receiver_waiting:
+                        await self._flow_lot.park()
+                        now = _core.current_time()
+                        continue
+                    chunk = bytes(view[offset : offset + 1])
+                else:
+                    available = int(self.max_buffer_size) - self._accepted_bytes
+                    if available == 0:
+                        await self._flow_lot.park()
+                        now = _core.current_time()
+                        continue
+                    chunk = bytes(view[offset : offset + available])
+                if self.bytes_per_second != inf:
+                    send_at = max(now, self._next_send_at)
+                    if send_at > now:
+                        await sleep_until(send_at)
+                        now = _core.current_time()
+                        if self.receive_closed:
+                            raise _core.BrokenResourceError
+                        if self.send_closed:
+                            raise _core.ClosedResourceError
+                        continue
+                    self._next_send_at = now + len(chunk) / self.bytes_per_second
+                self._enqueue(chunk, now)
+                offset += len(chunk)
+                now = _core.current_time()
+
+    async def wait_send_all_might_not_block(self) -> None:
+        with self._send_conflict_detector:
+            await _core.checkpoint()
+            await _core.checkpoint()
+            if self.send_closed:
+                raise _core.ClosedResourceError
+            if self.receive_closed:
+                raise _core.BrokenResourceError
+            might_not_block = (
+                self.max_buffer_size == inf
+                or self._accepted_bytes < self.max_buffer_size
+                or (self.max_buffer_size == 0 and self._receiver_waiting)
+            )
+            if not might_not_block:
+                await self._flow_lot.park()
+                if self.send_closed:
+                    raise _core.ClosedResourceError
+                if self.receive_closed:
+                    raise _core.BrokenResourceError
+
+    def send_eof(self) -> None:
+        if self.send_closed:
+            return
+        self._enqueue(None)
+        self.send_closed = True
+
+    def close_sender(self) -> None:
+        if not self.send_closed:
+            self.send_closed = True
+            self._enqueue(None)
+            self._flow_lot.unpark_all()
+            self._notify_data()
+
+    def close_receiver(self) -> None:
+        self.receive_closed = True
+        self._ready_buffer.clear()
+        self._scheduled.clear()
+        self._accepted_bytes = 0
+        self._ready_eof = False
+        self._receiver_waiting = False
+        self._flow_lot.unpark_all()
+        self._notify_data()
+
+    async def receive_some(self, max_bytes: int | None = None) -> bytes:
+        with self._receive_conflict_detector:
+            max_bytes = self._check_max_bytes(max_bytes)
+            await _core.checkpoint()
+            await _core.checkpoint()
+            if self.receive_closed:
+                raise _core.ClosedResourceError
+            self._receiver_waiting = True
+            if self.max_buffer_size == 0:
+                self._flow_lot.unpark_all()
+
+            while True:
+                self._pump()
+                if self._ready_buffer:
+                    data = self._drain_ready_buffer(max_bytes)
+                    assert data is not None
+                    self._receiver_waiting = False
+                    self._flow_lot.unpark_all()
+                    return data
+                if self._ready_eof:
+                    self._receiver_waiting = False
+                    return b""
+                if self.receive_closed:
+                    raise _core.ClosedResourceError
+
+                next_ready_at = self._next_ready_at()
+                event = Event()
+                self._data_event = event
+                try:
+                    with _core.CancelScope(
+                        deadline=next_ready_at if next_ready_at is not None else inf,
+                    ):
+                        await event.wait()
+                finally:
+                    self._data_event = None
+                    self._receiver_waiting = False
+                if self.receive_closed:
+                    raise _core.ClosedResourceError
+                self._receiver_waiting = True
+                if self.max_buffer_size == 0:
+                    self._flow_lot.unpark_all()
+
+    @staticmethod
+    def _check_max_bytes(max_bytes: int | None) -> int | None:
+        if max_bytes is not None:
+            max_bytes = operator.index(max_bytes)
+            if max_bytes < 1:
+                raise ValueError("max_bytes must be >= 1")
+        return max_bytes
+
+
+@_util.final
+class _TimedMemorySendStream(SendStream):
+    def __init__(self, link: _TimedMemoryLink) -> None:
+        self._link = link
+
+    async def send_all(self, data: bytes | bytearray | memoryview) -> None:
+        await self._link.send_all(data)
+
+    async def wait_send_all_might_not_block(self) -> None:
+        await self._link.wait_send_all_might_not_block()
+
+    async def send_eof(self) -> None:
+        with self._link._send_conflict_detector:
+            await _core.checkpoint()
+            await _core.checkpoint()
+            if self._link.send_closed:
+                return
+            if self._link.receive_closed:
+                raise _core.BrokenResourceError
+            self._link.send_eof()
+
+    def close(self) -> None:
+        self._link.close_sender()
+
+    async def aclose(self) -> None:
+        self.close()
+        await _core.checkpoint()
+
+
+@_util.final
+class _TimedMemoryReceiveStream(ReceiveStream):
+    def __init__(self, link: _TimedMemoryLink) -> None:
+        self._link = link
+
+    async def receive_some(self, max_bytes: int | None = None) -> bytes:
+        return await self._link.receive_some(max_bytes)
+
+    def close(self) -> None:
+        self._link.close_receiver()
+
+    async def aclose(self) -> None:
+        self.close()
+        await _core.checkpoint()
 
 
 ################################################################
@@ -323,7 +599,15 @@ def memory_stream_pump(
     return True
 
 
-def memory_stream_one_way_pair() -> tuple[MemorySendStream, MemoryReceiveStream]:
+def memory_stream_one_way_pair(
+    delay: float | None = None,
+    bytes_per_second: float | None = None,
+    max_buffer_size: int | float | None = None,
+    *,
+    latency: float | None = None,
+    bandwidth: float | None = None,
+    buffer_size: int | float | None = None,
+) -> tuple[SendStream, ReceiveStream]:
     """Create a connected, pure-Python, unidirectional stream with infinite
     buffering and flexible configuration options.
 
@@ -347,6 +631,23 @@ def memory_stream_one_way_pair() -> tuple[MemorySendStream, MemoryReceiveStream]
     :func:`memory_stream_pair` for a more elaborate example.
 
     """
+    if (
+        delay is not None
+        or latency is not None
+        or bytes_per_second is not None
+        or bandwidth is not None
+        or max_buffer_size is not None
+        or buffer_size is not None
+    ):
+        return virtual_memory_stream_one_way_pair(
+            delay if delay is not None else 0.0,
+            bytes_per_second=inf if bytes_per_second is None else bytes_per_second,
+            max_buffer_size=inf if max_buffer_size is None else max_buffer_size,
+            latency=latency,
+            bandwidth=bandwidth,
+            buffer_size=buffer_size,
+        )
+
     send_stream = MemorySendStream()
     recv_stream = MemoryReceiveStream()
 
@@ -375,9 +676,17 @@ def _make_stapled_pair(
     return stream1, stream2
 
 
-def memory_stream_pair() -> tuple[
-    StapledStream[MemorySendStream, MemoryReceiveStream],
-    StapledStream[MemorySendStream, MemoryReceiveStream],
+def memory_stream_pair(
+    delay: float | None = None,
+    bytes_per_second: float | None = None,
+    max_buffer_size: int | float | None = None,
+    *,
+    latency: float | None = None,
+    bandwidth: float | None = None,
+    buffer_size: int | float | None = None,
+) -> tuple[
+    StapledStream[SendStream, ReceiveStream],
+    StapledStream[SendStream, ReceiveStream],
 ]:
     """Create a connected, pure-Python, bidirectional stream with infinite
     buffering and flexible configuration options.
@@ -452,7 +761,169 @@ def memory_stream_pair() -> tuple[
     sending side.
 
     """
-    return _make_stapled_pair(memory_stream_one_way_pair)
+    if (
+        delay is None
+        and latency is None
+        and bytes_per_second is None
+        and bandwidth is None
+        and max_buffer_size is None
+        and buffer_size is None
+    ):
+        return _make_stapled_pair(memory_stream_one_way_pair)
+
+    return _make_stapled_pair(
+        lambda: memory_stream_one_way_pair(
+            delay if delay is not None else 0.0,
+            latency=latency,
+            bytes_per_second=bytes_per_second,
+            bandwidth=bandwidth,
+            max_buffer_size=max_buffer_size,
+            buffer_size=buffer_size,
+        ),
+    )
+
+
+def _validate_timed_link_options(
+    delay: float,
+    bytes_per_second: float,
+    max_buffer_size: int | float,
+) -> tuple[float, float, int | float]:
+    delay = float(delay)
+    if isnan(delay) or delay < 0 or not isfinite(delay):
+        raise ValueError("delay must be a finite, non-negative number")
+
+    bytes_per_second = float(bytes_per_second)
+    if isnan(bytes_per_second) or bytes_per_second <= 0:
+        raise ValueError("bytes_per_second must be positive or math.inf")
+
+    if max_buffer_size != inf:
+        max_buffer_size = operator.index(max_buffer_size)
+        if max_buffer_size < 0:
+            raise ValueError("max_buffer_size must be >= 0 or math.inf")
+
+    return delay, bytes_per_second, max_buffer_size
+
+
+def virtual_memory_stream_one_way_pair(
+    delay: float = 0.0,
+    bytes_per_second: float = inf,
+    max_buffer_size: int | float = inf,
+    *,
+    latency: float | None = None,
+    bandwidth: float | None = None,
+    buffer_size: int | float | None = None,
+) -> tuple[_TimedMemorySendStream, _TimedMemoryReceiveStream]:
+    """Create a one-way, clock-controlled in-memory stream pair.
+
+    ``delay`` is the fixed propagation delay. ``bytes_per_second`` schedules
+    acceptance of bytes at that rate, and ``max_buffer_size`` bounds bytes
+    accepted by the simulated link but not yet returned by the receiver.
+
+    A completed :meth:`~trio.abc.SendStream.send_all` means all of its bytes
+    have been accepted into the link. Accepted bytes are delivered in order,
+    and half-close EOF is scheduled after all of them.
+
+    """
+    if latency is not None:
+        delay = latency
+    if bandwidth is not None:
+        bytes_per_second = bandwidth
+    if buffer_size is not None:
+        max_buffer_size = buffer_size
+
+    delay, bytes_per_second, max_buffer_size = _validate_timed_link_options(
+        delay,
+        bytes_per_second,
+        max_buffer_size,
+    )
+    link = _TimedMemoryLink(delay, bytes_per_second, max_buffer_size)
+    return _TimedMemorySendStream(link), _TimedMemoryReceiveStream(link)
+
+
+def virtual_memory_stream_pair(
+    delay: float = 0.0,
+    bytes_per_second: float = inf,
+    max_buffer_size: int | float = inf,
+    *,
+    latency: float | None = None,
+    bandwidth: float | None = None,
+    buffer_size: int | float | None = None,
+) -> tuple[
+    StapledStream[_TimedMemorySendStream, _TimedMemoryReceiveStream],
+    StapledStream[_TimedMemorySendStream, _TimedMemoryReceiveStream],
+]:
+    """Create a bidirectional pair of clock-controlled in-memory streams.
+
+    Both directions use the same fixed delay, byte rate, and buffer cap. For
+    asymmetric links, combine two calls to
+    :func:`virtual_memory_stream_one_way_pair` with
+    :class:`~trio.StapledStream`.
+
+    """
+    return _make_stapled_pair(
+        lambda: virtual_memory_stream_one_way_pair(
+            delay,
+            bytes_per_second=bytes_per_second,
+            max_buffer_size=max_buffer_size,
+            latency=latency,
+            bandwidth=bandwidth,
+            buffer_size=buffer_size,
+        ),
+    )
+
+
+def memory_network_stream_one_way_pair(
+    delay: float = 0.0,
+    bytes_per_second: float = inf,
+    max_buffer_size: int | float = inf,
+) -> tuple[_TimedMemorySendStream, _TimedMemoryReceiveStream]:
+    return virtual_memory_stream_one_way_pair(
+        delay,
+        bytes_per_second=bytes_per_second,
+        max_buffer_size=max_buffer_size,
+    )
+
+
+def memory_network_stream_pair(
+    delay: float = 0.0,
+    bytes_per_second: float = inf,
+    max_buffer_size: int | float = inf,
+) -> tuple[
+    StapledStream[_TimedMemorySendStream, _TimedMemoryReceiveStream],
+    StapledStream[_TimedMemorySendStream, _TimedMemoryReceiveStream],
+]:
+    return virtual_memory_stream_pair(
+        delay,
+        bytes_per_second=bytes_per_second,
+        max_buffer_size=max_buffer_size,
+    )
+
+
+virtual_stream_one_way_pair = virtual_memory_stream_one_way_pair
+virtual_stream_pair = virtual_memory_stream_pair
+
+
+def memory_link_one_way_pair(
+    latency: float = 0.0,
+    bandwidth: float = inf,
+    buffer_size: int | float = inf,
+) -> tuple[_TimedMemorySendStream, _TimedMemoryReceiveStream]:
+    return virtual_memory_stream_one_way_pair(
+        latency,
+        bandwidth,
+        buffer_size,
+    )
+
+
+def memory_link_pair(
+    latency: float = 0.0,
+    bandwidth: float = inf,
+    buffer_size: int | float = inf,
+) -> tuple[
+    StapledStream[_TimedMemorySendStream, _TimedMemoryReceiveStream],
+    StapledStream[_TimedMemorySendStream, _TimedMemoryReceiveStream],
+]:
+    return virtual_memory_stream_pair(latency, bandwidth, buffer_size)
 
 
 ################################################################

@@ -137,6 +137,15 @@ Trio also provides some specialized functions for testing completely
 exhibit an extreme kind of behavior that's good at catching out edge
 cases in protocol implementations.
 
+For tests that need a low-bandwidth, fixed-latency connection, Trio also
+provides :func:`virtual_memory_stream_one_way_pair` and
+:func:`virtual_memory_stream_pair`. Their delay, byte rate, and accepted-byte
+buffer cap are all configurable, and their timing follows the current Trio
+clock, so they work with :class:`MockClock` without using real threads or
+sockets. Completion of ``send_all`` means the bytes were accepted by the
+simulated link, not that they were received; pausing the receiver applies
+backpressure once the buffer cap is reached.
+
 
 API details
 ~~~~~~~~~~~
@@ -152,6 +161,10 @@ API details
 .. autofunction:: memory_stream_one_way_pair
 
 .. autofunction:: memory_stream_pair
+
+.. autofunction:: virtual_memory_stream_one_way_pair
+
+.. autofunction:: virtual_memory_stream_pair
 
 .. autofunction:: lockstep_stream_one_way_pair
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # XX this should get broken up, like testing.py did
 import tempfile
+from math import inf
 from typing import TYPE_CHECKING
 
 import pytest
@@ -12,7 +13,7 @@ from .._highlevel_generic import StapledStream, aclose_forcefully
 from .._highlevel_socket import SocketListener
 from ..testing import *
 from ..testing._check_streams import _assert_raises
-from ..testing._memory_streams import _UnboundedByteQueue
+from ..testing._memory_streams import _TimedMemoryLink, _UnboundedByteQueue
 
 if TYPE_CHECKING:
     from trio import Nursery
@@ -594,6 +595,170 @@ async def test_memory_stream_pair() -> None:
     async with _core.open_nursery() as nursery:
         nursery.start_soon(receiver)
         nursery.start_soon(sender)
+
+
+async def test_virtual_memory_stream_pair_timing(mock_clock: MockClock) -> None:
+    left, right = virtual_memory_stream_pair(
+        1,
+        bytes_per_second=inf,
+        max_buffer_size=10,
+    )
+    left_to_right = right.receive_stream._link
+    right_to_left = left.receive_stream._link
+
+    def blocked(link: _TimedMemoryLink) -> bool:
+        return link._data_event is not None and not link._data_event.is_set()
+
+    async def send_later(data: bytes) -> None:
+        await sleep(0.5)
+        await left.send_all(data)
+
+    received: list[tuple[str, bytes]] = []
+
+    async def receive_from(side: str, stream: StapledStream) -> None:
+        received.append((side, await stream.receive_some(10)))
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(right.send_all, b"ab")
+        nursery.start_soon(send_later, b"xy")
+        nursery.start_soon(receive_from, "left", left)
+        nursery.start_soon(receive_from, "right", right)
+        await wait_all_tasks_blocked()
+
+        assert blocked(left_to_right)
+        assert blocked(right_to_left)
+        mock_clock.jump(1)
+        await wait_all_tasks_blocked()
+        assert blocked(left_to_right)
+        assert not blocked(right_to_left)
+        assert received == [("left", b"ab")]
+
+        mock_clock.jump(1)
+        await wait_all_tasks_blocked()
+        assert not blocked(left_to_right)
+        assert received == [("left", b"ab"), ("right", b"xy")]
+
+        await left.send_eof()
+        mock_clock.jump(1)
+        assert await right.receive_some(10) == b""
+
+
+async def test_virtual_memory_stream_byte_rate_timing(
+    mock_clock: MockClock,
+) -> None:
+    send, receive = virtual_memory_stream_one_way_pair(
+        0.5,
+        bytes_per_second=1,
+    )
+
+    async def send_abc() -> None:
+        await send.send_all(b"abc")
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(send_abc)
+        await wait_all_tasks_blocked()
+
+        mock_clock.jump(1.5)
+        await wait_all_tasks_blocked()
+        assert await receive.receive_some(1) == b"a"
+        mock_clock.jump(1)
+        await wait_all_tasks_blocked()
+        assert await receive.receive_some(1) == b"b"
+        mock_clock.jump(1)
+        await wait_all_tasks_blocked()
+        assert await receive.receive_some(1) == b"c"
+
+
+async def test_virtual_memory_stream_backpressure_and_cancel(
+    autojump_clock: MockClock,
+) -> None:
+    send, receive = virtual_memory_stream_one_way_pair(
+        0,
+        bytes_per_second=inf,
+        max_buffer_size=2,
+    )
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(send.send_all, b"abcd")
+        await wait_all_tasks_blocked()
+        assert len(send._link._flow_lot) == 1
+
+        assert await receive.receive_some(1) == b"a"
+        await wait_all_tasks_blocked()
+        assert len(send._link._flow_lot) == 1
+
+        assert await receive.receive_some(1) == b"b"
+        await wait_all_tasks_blocked()
+        assert len(send._link._flow_lot) == 0
+
+
+async def test_virtual_memory_stream_cancel_does_not_duplicate(
+    autojump_clock: MockClock,
+) -> None:
+    send, receive = virtual_memory_stream_one_way_pair(
+        1,
+        bytes_per_second=1,
+        max_buffer_size=2,
+    )
+
+    with _core.CancelScope() as scope:
+        scope.cancel()
+        with pytest.raises(_core.Cancelled):
+            await send.send_all(b"abc")
+
+    await send.aclose()
+    await sleep(1)
+    assert await receive.receive_some(10) == b""
+
+    send2, receive2 = virtual_memory_stream_one_way_pair(
+        1,
+        bytes_per_second=1,
+        max_buffer_size=2,
+    )
+
+    async def cancel_sending2() -> None:
+        await send2.send_all(b"abc")
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(cancel_sending2)
+        await wait_all_tasks_blocked()
+        assert len(send2._link._flow_lot) == 1
+        nursery.cancel_scope.cancel()
+
+    await send2.aclose()
+    await sleep(3)
+    assert await receive2.receive_some(2) == b"ab"
+    await sleep(1)
+    assert await receive2.receive_some(10) == b""
+
+
+async def test_virtual_memory_streams_with_generic_tests(
+    autojump_clock: MockClock,
+) -> None:
+    async def one_way_stream_maker() -> tuple[SendStream, ReceiveStream]:
+        return virtual_memory_stream_one_way_pair()
+
+    async def clogged_one_way_stream_maker() -> tuple[SendStream, ReceiveStream]:
+        return virtual_memory_stream_one_way_pair(max_buffer_size=0)
+
+    await check_one_way_stream(
+        one_way_stream_maker,
+        clogged_one_way_stream_maker,
+    )
+
+    async def half_closeable_stream_maker() -> tuple[StapledStream, StapledStream]:
+        return virtual_memory_stream_pair()
+
+    async def clogged_half_closeable_stream_maker() -> tuple[
+        StapledStream,
+        StapledStream,
+    ]:
+        return virtual_memory_stream_pair(max_buffer_size=0)
+
+    await check_half_closeable_stream(
+        half_closeable_stream_maker,
+        clogged_half_closeable_stream_maker,
+    )
 
 
 async def test_memory_streams_with_generic_tests() -> None:

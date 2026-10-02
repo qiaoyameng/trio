@@ -24,9 +24,17 @@ from ._memory_streams import (
     MemorySendStream as MemorySendStream,
     lockstep_stream_one_way_pair as lockstep_stream_one_way_pair,
     lockstep_stream_pair as lockstep_stream_pair,
+    memory_link_one_way_pair as memory_link_one_way_pair,
+    memory_link_pair as memory_link_pair,
+    memory_network_stream_one_way_pair as memory_network_stream_one_way_pair,
+    memory_network_stream_pair as memory_network_stream_pair,
     memory_stream_one_way_pair as memory_stream_one_way_pair,
     memory_stream_pair as memory_stream_pair,
     memory_stream_pump as memory_stream_pump,
+    virtual_stream_one_way_pair as virtual_stream_one_way_pair,
+    virtual_stream_pair as virtual_stream_pair,
+    virtual_memory_stream_one_way_pair as virtual_memory_stream_one_way_pair,
+    virtual_memory_stream_pair as virtual_memory_stream_pair,
 )
 from ._network import open_stream_to_socket_listener as open_stream_to_socket_listener
 from ._raises_group import Matcher as _Matcher, RaisesGroup as _RaisesGroup
